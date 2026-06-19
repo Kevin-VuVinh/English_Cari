@@ -1,366 +1,10 @@
- <html lang="vi"><head>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures (htmlToImage undefined) and toPng errors
-            // so the parent always gets a response instead of hanging forever.
-            try {
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
+<!DOCTYPE html>
+<html lang="vi">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>English Star ⭐ Học Tiếng Anh CEFR</title>
-<link href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,600;0,700;0,800;0,900;1,400&amp;family=Baloo+2:wght@400;600;700;800&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,600;0,700;0,800;0,900;1,400&family=Baloo+2:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root{
   --blue:#2563eb;--blue2:#3b82f6;--blue-bg:#dbeafe;
@@ -840,7 +484,7 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
 </style>
 </head>
-<body id="artifacts-component-root-html">
+<body>
 
 <!-- ══ HEADER ══ -->
 <header>
@@ -866,7 +510,7 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
 <!-- ══ TABS ══ -->
 <div class="tabs">
-  <button class="tab" onclick="switchTab('home',this)"><span class="ti">🏠</span>Tổng quan</button>
+  <button class="tab active" onclick="switchTab('home',this)"><span class="ti">🏠</span>Tổng quan</button>
   <button class="tab" onclick="switchTab('chat',this)"><span class="ti">💬</span>Chat AI</button>
   <button class="tab" onclick="switchTab('vocab',this)"><span class="ti">📚</span>Từ vựng</button>
   <button class="tab" onclick="switchTab('flashcard',this)"><span class="ti">🃏</span>Flashcard</button>
@@ -875,24 +519,24 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
   <button class="tab" onclick="switchTab('exam',this)"><span class="ti">📝</span>Đề thi</button>
   <button class="tab" onclick="switchTab('games',this)"><span class="ti">🎮</span>Games</button>
   <button class="tab" onclick="switchTab('progress',this)"><span class="ti">📈</span>Tiến độ</button>
-  <button class="tab active" onclick="switchTab('import',this)"><span class="ti">📥</span>Import</button>
+  <button class="tab" onclick="switchTab('import',this)"><span class="ti">📥</span>Import</button>
 </div>
 
 <!-- ══ HOME ══ -->
-<div id="panel-home" class="panel">
+<div id="panel-home" class="panel active">
   <div class="card" style="margin-bottom:12px">
     <div class="card-body">
-      <div style="font-size:.8rem;font-weight:800;color:var(--muted);margin-bottom:8px;" id="cefrLabel">A1 – Beginner (~300 từ cơ bản nhất)</div>
+      <div style="font-size:.8rem;font-weight:800;color:var(--muted);margin-bottom:8px;" id="cefrLabel">A1 – Beginner (300 từ vựng cơ bản)</div>
       <div class="cefr-bar" id="cefrBar">
         <div class="cefr-pill" style="background:var(--c1)"></div>
-        <div class="cefr-pill" style="background: var(--border);"></div><div class="cefr-pill" style="background: var(--border);"></div>
-        <div class="cefr-pill" style="background: var(--border);"></div><div class="cefr-pill" style="background: var(--border);"></div><div class="cefr-pill" style="background: var(--border);"></div>
+        <div class="cefr-pill"></div><div class="cefr-pill"></div>
+        <div class="cefr-pill"></div><div class="cefr-pill"></div><div class="cefr-pill"></div>
       </div>
     </div>
   </div>
 
   <div class="level-grid">
-    <div class="lc active" id="lc-A1" onclick="changeLevel('A1')" style="border-color:var(--c1)">
+    <div class="lc" id="lc-A1" onclick="changeLevel('A1')" style="border-color:var(--c1)">
       <div class="lc-badge" style="color:var(--c1)">A1</div>
       <div class="lc-big" style="color:var(--c1)">ABC</div>
       <div class="lc-name" style="color:var(--c1)">Beginner</div>
@@ -933,41 +577,17 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
   <div class="stats-row">
     <div class="stat-mini"><div class="sn">🔥 <span id="st-streak">7</span></div><div class="sl">Ngày liên tiếp</div></div>
     <div class="stat-mini"><div class="sn">⭐ <span id="st-xp">0</span></div><div class="sl">Điểm XP</div></div>
-    <div class="stat-mini"><div class="sn">📚 <span id="st-words">280</span></div><div class="sl">Từ đã học</div></div>
+    <div class="stat-mini"><div class="sn">📚 <span id="st-words">0</span></div><div class="sl">Từ đã học</div></div>
     <div class="stat-mini"><div class="sn">✅ <span id="st-acc">—</span></div><div class="sl">Chính xác</div></div>
   </div>
 
   <div class="card">
-    <div class="card-header"><h3>📅 Mục tiêu hôm nay</h3><span id="todayDate" style="font-size:.7rem;color:var(--muted)">Thứ Sáu, 19 tháng 6, 2026</span></div>
-    <div class="card-body" id="todayGoals">
-    <div class="goal-row">
-      <div class="goal-icon">🃏</div>
-      <div class="goal-label">Học 10 flashcard</div>
-      <div class="goal-track"><div class="goal-fill" style="width:0%"></div></div>
-      <div class="goal-val">0/10</div>
-    </div>
-    <div class="goal-row">
-      <div class="goal-icon">🧠</div>
-      <div class="goal-label">Hoàn thành 1 bài quiz</div>
-      <div class="goal-track"><div class="goal-fill" style="width:0%"></div></div>
-      <div class="goal-val">0/1</div>
-    </div>
-    <div class="goal-row">
-      <div class="goal-icon">🎮</div>
-      <div class="goal-label">Chơi 1 mini game</div>
-      <div class="goal-track"><div class="goal-fill" style="width:0%"></div></div>
-      <div class="goal-val">0/1</div>
-    </div>
-    <div class="goal-row">
-      <div class="goal-icon">💬</div>
-      <div class="goal-label">Chat 5 câu tiếng Anh</div>
-      <div class="goal-track"><div class="goal-fill" style="width:0%"></div></div>
-      <div class="goal-val">0/5</div>
-    </div></div>
+    <div class="card-header"><h3>📅 Mục tiêu hôm nay</h3><span id="todayDate" style="font-size:.7rem;color:var(--muted)"></span></div>
+    <div class="card-body" id="todayGoals"></div>
   </div>
   <div class="card">
     <div class="card-header"><h3>💡 Mẹo học tiếng Anh</h3></div>
-    <div class="card-body"><div class="tip-box" id="tipBox">📝 <strong>Học từ trong ngữ cảnh</strong> — đừng học từ đơn lẻ. Hãy học cả câu ví dụ: 'I <em>eat</em> an apple every morning.'</div></div>
+    <div class="card-body"><div class="tip-box" id="tipBox"></div></div>
   </div>
 </div>
 
@@ -985,17 +605,11 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
         <p id="sceneDesc">Order drinks, ask the price</p>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
-        <span id="chat-level-badge" style="font-size: 0.68rem; font-weight: 800; background: var(--c1)22; color: var(--c1); border-radius: 8px; padding: 3px 9px; white-space: nowrap;">📊 A1</span>
-        <select class="scene-sel" id="sceneSelect" onchange="changeScene(this.value)"><option value="cafe">☕ At the Café</option><option value="greetings">👋 Greetings</option><option value="classroom">🏫 In the Classroom</option><option value="playground">🎮 On the Playground</option></select>
+        <span id="chat-level-badge" style="font-size:.68rem;font-weight:800;background:rgba(255,255,255,.2);color:#fff;border-radius:8px;padding:3px 9px;white-space:nowrap">📊 A1</span>
+        <select class="scene-sel" id="sceneSelect" onchange="changeScene(this.value)"></select>
       </div>
     </div>
-    <div class="chat-msgs" id="chatMsgs"><div class="msg">
-    <div class="msg-av">🤖</div>
-    <div class="msg-bubble">
-      <div>Hi there! Welcome to our café! 😊 What would you like to drink today?</div>
-      
-      <button class="speak-btn" onclick="speakText('Hi there! Welcome to our café! 😊 What would you like to drink today?')">🔊</button>
-    </div></div></div>
+    <div class="chat-msgs" id="chatMsgs"></div>
     <div class="listen-bar" id="listenBar">
       <div style="display:flex;gap:3px;align-items:center">
         <div class="wb"></div><div class="wb"></div><div class="wb"></div><div class="wb"></div><div class="wb"></div>
@@ -1004,17 +618,17 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
       <span id="interimText" style="font-style:italic;opacity:.8;flex:1"></span>
       <button onclick="stopRecording()" style="background:rgba(255,255,255,.22);border:1px solid rgba(255,255,255,.4);border-radius:8px;color:#fff;font-size:.7rem;padding:3px 9px;cursor:pointer;font-family:inherit">⏹ Dừng</button>
     </div>
-    <div class="suggests" id="suggests"><div class="sug-chip" onclick="useSug(this)">A coffee please!</div><div class="sug-chip" onclick="useSug(this)">How much is it?</div><div class="sug-chip" onclick="useSug(this)">Can I have the menu?</div><div class="sug-chip" onclick="useSug(this)">Thank you!</div></div>
+    <div class="suggests" id="suggests"></div>
     <div class="voice-toolbar">
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
         <span style="font-size:.8rem">🔊</span>
         <select class="spd-sel" id="ttsSpeed">
           <option value="0.5">🐢 Rất chậm</option>
-          <option value="0.72" selected="">🚶 Chậm</option>
+          <option value="0.72" selected>🚶 Chậm</option>
           <option value="0.9">▶ Vừa</option>
           <option value="1.1">⚡ Nhanh</option>
         </select>
-        <select class="spd-sel" id="ttsVoice" style="max-width:140px"><option value="Microsoft David - English (United States)">Microsoft David - English (United States) (en-US)</option><option value="Microsoft Mark - English (United States)">Microsoft Mark - English (United States) (en-US)</option><option value="Microsoft Zira - English (United States)">Microsoft Zira - English (United States) (en-US)</option><option value="Google US English">Google US English (en-US)</option><option value="Google UK English Female">Google UK English Female (en-GB)</option><option value="Google UK English Male">Google UK English Male (en-GB)</option></select>
+        <select class="spd-sel" id="ttsVoice" style="max-width:140px"><option value="">⏳ Đang tải...</option></select>
         <button class="auto-btn" id="autoBtn" onclick="toggleAutoSpeak()">🔇 Auto: Tắt</button>
       </div>
       <div style="display:flex;align-items:center;gap:5px">
@@ -1035,21 +649,24 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
   <div class="card">
     <div class="card-header">
       <h3>📚 Từ vựng theo chủ đề</h3>
-      <span id="vocab-count" style="font-size:.72rem;color:var(--muted)">8 từ (A1)</span>
+      <span id="vocab-count" style="font-size:.72rem;color:var(--muted)"></span>
     </div>
     <div class="card-body" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding-bottom:10px">
       <!-- Topic dropdown -->
       <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:180px">
         <label style="font-size:.78rem;font-weight:700;color:var(--muted);white-space:nowrap">📂 Chủ đề:</label>
-        <select id="vocabTopicSel" onchange="onVocabTopicChange(this.value)" style="flex:1;border:1.5px solid var(--border);border-radius:10px;padding:7px 12px;
+        <select id="vocabTopicSel" onchange="onVocabTopicChange(this.value)"
+          style="flex:1;border:1.5px solid var(--border);border-radius:10px;padding:7px 12px;
                  font-family:'Nunito',sans-serif;font-size:.82rem;font-weight:700;
-                 color:var(--ink);background:var(--card);outline:none;cursor:pointer"><option value="A1 · Greetings">A1 · Greetings (8)</option><option value="A1 · Family">A1 · Family (8)</option><option value="A1 · Colors">A1 · Colors (8)</option><option value="A1 · Animals">A1 · Animals (8)</option><option value="A1 · Food &amp; Drinks">A1 · Food &amp; Drinks (8)</option><option value="A1 · School">A1 · School (8)</option><option value="A1 · Numbers &amp; Time">A1 · Numbers &amp; Time (8)</option><option value="A1 · Body Parts">A1 · Body Parts (8)</option></select>
+                 color:var(--ink);background:var(--card);outline:none;cursor:pointer"></select>
       </div>
 
       <!-- Level badge + show-all -->
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span style="font-size:.72rem;font-weight:700;color:var(--muted)">Trình độ:</span>
-        <span id="vocab-level-badge" style="background: var(--c1)22; color: var(--c1); border-radius: 8px; padding: 4px 10px; font-size: 0.72rem; font-weight: 800;">A1</span>
+        <span id="vocab-level-badge"
+          style="background:var(--blue-bg);color:var(--blue);border-radius:8px;
+                 padding:4px 10px;font-size:.72rem;font-weight:800">A1</span>
         <label style="display:flex;align-items:center;gap:4px;font-size:.72rem;
                       font-weight:700;color:var(--muted);cursor:pointer;white-space:nowrap">
           <input type="checkbox" id="vocabShowAll" onchange="renderVocab()" style="cursor:pointer">
@@ -1063,7 +680,8 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
                 padding:8px 14px 10px;border-top:1px solid var(--border);background:var(--light);
                 border-radius:0 0 13px 13px">
       <!-- Hide Vietnamese toggle -->
-      <button id="vocabHideVietBtn" onclick="toggleHideViet()" style="display:flex;align-items:center;gap:6px;padding:6px 14px;border-radius:20px;
+      <button id="vocabHideVietBtn" onclick="toggleHideViet()"
+        style="display:flex;align-items:center;gap:6px;padding:6px 14px;border-radius:20px;
                border:1.5px solid var(--border);background:var(--card);font-family:'Nunito',sans-serif;
                font-size:.75rem;font-weight:700;color:var(--muted);cursor:pointer;transition:all .15s">
         <span id="vocabHideVietIcon">👁</span>
@@ -1072,11 +690,13 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
       <!-- View mode: grid / list -->
       <div style="display:flex;border:1.5px solid var(--border);border-radius:20px;overflow:hidden;background:var(--card)">
-        <button id="vmode-grid" onclick="setVocabMode('grid')" style="padding:6px 14px;border:none;font-family:'Nunito',sans-serif;font-size:.75rem;
+        <button id="vmode-grid" onclick="setVocabMode('grid')"
+          style="padding:6px 14px;border:none;font-family:'Nunito',sans-serif;font-size:.75rem;
                  font-weight:700;cursor:pointer;background:var(--blue);color:#fff;transition:all .15s">
           ⊞ Lưới
         </button>
-        <button id="vmode-list" onclick="setVocabMode('list')" style="padding:6px 14px;border:none;font-family:'Nunito',sans-serif;font-size:.75rem;
+        <button id="vmode-list" onclick="setVocabMode('list')"
+          style="padding:6px 14px;border:none;font-family:'Nunito',sans-serif;font-size:.75rem;
                  font-weight:700;cursor:pointer;background:transparent;color:var(--muted);transition:all .15s">
           ☰ Danh sách
         </button>
@@ -1091,191 +711,7 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
     😅 Không có từ vựng nào ở trình độ này.<br>
     <span style="font-size:.78rem">Tích vào <strong>"Hiện tất cả trình độ"</strong> để xem tất cả, hoặc chọn trình độ khác.</span>
   </div>
-  <div class="vocab-grid" id="vocabGrid">
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('hello')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">HELLO</div>
-          <div class="vc-ph">/həˈloʊ/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">xin chào 👋</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">Hello! My name is Tom.</span>
-            <button class="vc-ex-speak" onclick="speakText('Hello! My name is Tom.')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div>
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('goodbye')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">GOODBYE</div>
-          <div class="vc-ph">/ˌɡʊdˈbaɪ/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">tạm biệt 👋</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">Goodbye! See you tomorrow.</span>
-            <button class="vc-ex-speak" onclick="speakText('Goodbye! See you tomorrow.')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div>
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('please')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">PLEASE</div>
-          <div class="vc-ph">/pliːz/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">xin / làm ơn 🙏</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">Can I have water, please?</span>
-            <button class="vc-ex-speak" onclick="speakText('Can I have water, please?')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div>
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('thank you')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">THANK YOU</div>
-          <div class="vc-ph">/ˈθæŋk juː/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">cảm ơn 🙏</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">Thank you for your help.</span>
-            <button class="vc-ex-speak" onclick="speakText('Thank you for your help.')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div>
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('sorry')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">SORRY</div>
-          <div class="vc-ph">/ˈsɒri/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">xin lỗi 😔</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">I am sorry I am late.</span>
-            <button class="vc-ex-speak" onclick="speakText('I am sorry I am late.')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div>
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('yes')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">YES</div>
-          <div class="vc-ph">/jes/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">có / vâng ✅</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">Yes, I understand.</span>
-            <button class="vc-ex-speak" onclick="speakText('Yes, I understand.')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div>
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('no')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">NO</div>
-          <div class="vc-ph">/noʊ/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">không ❌</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">No, that is not right.</span>
-            <button class="vc-ex-speak" onclick="speakText('No, that is not right.')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div>
-        <div class="vc" style="--vc-c:var(--blue)">
-          <!-- Word speaker -->
-          <button class="vc-speak" onclick="speakText('name')" title="Nghe phát âm">🔊</button>
-
-          <div class="vc-word">NAME</div>
-          <div class="vc-ph">/neɪm/</div>
-
-          <!-- Vietnamese meaning — blurred when hide mode ON, click to reveal -->
-          <div class="vc-viet-wrap" style="filter:none;user-select:auto;
-                   cursor:default;
-                   transition:filter .25s;margin-bottom:4px" title="" onclick="revealViet(this)">
-            <div class="vc-viet">tên 📛</div>
-          </div>
-
-          <!-- Example row: text + speaker -->
-          
-          <div class="vc-ex-row">
-            <span class="vc-ex">What is your name?</span>
-            <button class="vc-ex-speak" onclick="speakText('What is your name?')" title="Nghe câu ví dụ">🔊</button>
-          </div>
-
-          <span class="vc-lv-badge" style="background:var(--blue)22;color:var(--blue)">A1</span>
-        </div></div>
+  <div class="vocab-grid" id="vocabGrid"></div>
 </div>
 
 <!-- ══ FLASHCARD ══ -->
@@ -1284,28 +720,28 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
     <div class="card-body" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:180px">
         <label style="font-size:.78rem;font-weight:700;color:var(--muted);white-space:nowrap">📂 Chủ đề:</label>
-        <select id="fcTopicSel" onchange="onFCTopicChange(this.value)" style="flex:1;border:1.5px solid var(--border);border-radius:10px;padding:7px 12px;font-family:'Nunito',sans-serif;font-size:.82rem;font-weight:700;color:var(--ink);background:var(--card);outline:none;cursor:pointer"><option value="A1 · Greetings">A1 · Greetings (8)</option><option value="A1 · Family">A1 · Family (8)</option><option value="A1 · Colors">A1 · Colors (8)</option><option value="A1 · Animals">A1 · Animals (8)</option><option value="A1 · Food &amp; Drinks">A1 · Food &amp; Drinks (8)</option><option value="A1 · School">A1 · School (8)</option><option value="A1 · Numbers &amp; Time">A1 · Numbers &amp; Time (8)</option><option value="A1 · Body Parts">A1 · Body Parts (8)</option></select>
+        <select id="fcTopicSel" onchange="onFCTopicChange(this.value)" style="flex:1;border:1.5px solid var(--border);border-radius:10px;padding:7px 12px;font-family:'Nunito',sans-serif;font-size:.82rem;font-weight:700;color:var(--ink);background:var(--card);outline:none;cursor:pointer"></select>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
         <span style="font-size:.72rem;font-weight:700;color:var(--muted)">Trình độ:</span>
-        <span id="fc-level-badge" style="background: var(--c1)22; color: var(--c1); border-radius: 8px; padding: 4px 10px; font-size: 0.72rem; font-weight: 800;">A1</span>
+        <span id="fc-level-badge" style="background:var(--blue-bg);color:var(--blue);border-radius:8px;padding:4px 10px;font-size:.72rem;font-weight:800">A1</span>
         <label style="display:flex;align-items:center;gap:4px;font-size:.72rem;font-weight:700;color:var(--muted);cursor:pointer">
           <input type="checkbox" id="fcShowAll" onchange="loadCard()" style="cursor:pointer"> Hiện tất cả trình độ
         </label>
       </div>
     </div>
   </div>
-  <div class="fc-progress" id="fcProgress">Thẻ 1 / 8 — A1 · Greetings [A1]</div>
+  <div class="fc-progress" id="fcProgress">Thẻ 1 / 6</div>
   <div class="fc-wrap">
     <div class="fc" id="fc" onclick="flipCard()">
       <div class="fc-face fc-front">
-        <div class="fc-word" id="fcWord">HELLO</div>
-        <div class="fc-ph" id="fcPh">/həˈloʊ/</div>
+        <div class="fc-word" id="fcWord">DOG</div>
+        <div class="fc-ph" id="fcPh">/dɒɡ/</div>
         <div class="fc-hint">👆 Nhấn để xem nghĩa</div>
       </div>
       <div class="fc-face fc-back">
-        <div class="fc-viet" id="fcViet">xin chào 👋</div>
-        <div class="fc-ex" id="fcEx">"Hello! My name is Tom." — Xin chào! Tên tôi là Tom.</div>
+        <div class="fc-viet" id="fcViet">Con chó 🐶</div>
+        <div class="fc-ex" id="fcEx">"I have a dog." — Tôi có một con chó.</div>
       </div>
     </div>
   </div>
@@ -1328,24 +764,33 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
     <div class="card-body" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
 
       <!-- Level badge -->
-      <span id="quiz-level-badge" style="font-size: 0.72rem; font-weight: 800; background: var(--c1)22; color: var(--c1); border-radius: 8px; padding: 5px 12px; white-space: nowrap; flex-shrink: 0;">📊 A1 · 64 từ</span>
+      <span id="quiz-level-badge"
+        style="font-size:.72rem;font-weight:800;background:var(--blue-bg);color:var(--blue);
+               border-radius:8px;padding:5px 12px;white-space:nowrap;flex-shrink:0">
+        📊 A1
+      </span>
 
       <!-- Topic filter -->
       <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:150px">
         <label style="font-size:.75rem;font-weight:700;color:var(--muted);white-space:nowrap">📂 Chủ đề:</label>
-        <select id="quizTopicSel" style="flex:1;border:1.5px solid var(--border);border-radius:8px;padding:6px 10px;
+        <select id="quizTopicSel"
+          style="flex:1;border:1.5px solid var(--border);border-radius:8px;padding:6px 10px;
                  font-family:'Nunito',sans-serif;font-size:.78rem;font-weight:700;
-                 color:var(--ink);background:var(--card);outline:none;cursor:pointer" onchange="buildQuizPool()"><option value="__all__">📚 Tất cả chủ đề (64 từ)</option><option value="A1 · Greetings">A1 · Greetings (8)</option><option value="A1 · Family">A1 · Family (8)</option><option value="A1 · Colors">A1 · Colors (8)</option><option value="A1 · Animals">A1 · Animals (8)</option><option value="A1 · Food &amp; Drinks">A1 · Food &amp; Drinks (8)</option><option value="A1 · School">A1 · School (8)</option><option value="A1 · Numbers &amp; Time">A1 · Numbers &amp; Time (8)</option><option value="A1 · Body Parts">A1 · Body Parts (8)</option></select>
+                 color:var(--ink);background:var(--card);outline:none;cursor:pointer"
+          onchange="buildQuizPool()">
+          <option value="__all__">📚 Tất cả chủ đề</option>
+        </select>
       </div>
 
       <!-- Question count -->
       <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
         <label style="font-size:.75rem;font-weight:700;color:var(--muted)">Số câu:</label>
-        <select id="quizCountSel" style="border:1.5px solid var(--border);border-radius:8px;padding:6px 10px;
+        <select id="quizCountSel"
+          style="border:1.5px solid var(--border);border-radius:8px;padding:6px 10px;
                  font-family:'Nunito',sans-serif;font-size:.78rem;font-weight:700;
                  color:var(--ink);background:var(--card);outline:none;cursor:pointer">
           <option value="5">5</option>
-          <option value="8" selected="">8</option>
+          <option value="8" selected>8</option>
           <option value="12">12</option>
           <option value="20">20</option>
         </select>
@@ -1356,23 +801,23 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
     <!-- Answer mode tabs -->
     <div style="display:flex;gap:0;border-top:1px solid var(--border);margin-top:0">
-      <button id="qmode-mc" class="qmode-tab active" onclick="setQuizMode('mc')">
+      <button id="qmode-mc"   class="qmode-tab active" onclick="setQuizMode('mc')">
         🔘 Chọn đáp án
       </button>
       <button id="qmode-type" class="qmode-tab" onclick="setQuizMode('type')">
         ⌨️ Gõ câu trả lời
       </button>
-      <button id="qmode-mic" class="qmode-tab" onclick="setQuizMode('mic')">
+      <button id="qmode-mic"  class="qmode-tab" onclick="setQuizMode('mic')">
         🎤 Dùng mic
       </button>
-      <button id="qmode-mix" class="qmode-tab" onclick="setQuizMode('mix')">
+      <button id="qmode-mix"  class="qmode-tab" onclick="setQuizMode('mix')">
         🎲 Hỗn hợp
       </button>
     </div>
   </div>
 
   <!-- Score / progress -->
-  <div class="quiz-hdr" id="quizHdr" style="display: flex;">
+  <div class="quiz-hdr" id="quizHdr" style="display:none">
     <div style="display:flex;align-items:center;gap:6px">
       <div class="quiz-score-lbl" id="quizScoreLbl">⭐ 0 / 8</div>
       <span id="quizStreakLbl" style="font-size:.75rem;font-weight:800;color:var(--amber);display:none"></span>
@@ -1381,28 +826,7 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
     <button class="abtn sm" onclick="startQuiz()">🔄 Mới</button>
   </div>
 
-  <div id="quizArea"><div class="quiz-q-card">
-       
-      <div class="quiz-qnum">Câu 1/8 &nbsp;·&nbsp; 🇬🇧 Tiếng Anh → Tiếng Việt</div>
-      <div style="text-align:center;margin:12px 0 6px">
-        <div class="quiz-word-display">BOOK</div>
-        <div class="quiz-ph">/bʊk/</div>
-        <button class="quiz-speak-btn" onclick="speakText('book')">🔊 Nghe</button>
-      </div>
-      <div class="quiz-q" style="text-align:center;margin-top:6px">Nghĩa tiếng Việt là gì?</div>
-       <div id="qAnswerZone" style="margin-top:10px"><div class="quiz-opts" style="margin-top:4px">
-    <button class="qopt" data-correct="false" onclick="submitMC(this,false,'book','sách 📚')">
-        <span style="font-weight:800;color:var(--muted);margin-right:5px">A.</span>màu đen
-      </button><button class="qopt" data-correct="false" onclick="submitMC(this,false,'book','sách 📚')">
-        <span style="font-weight:800;color:var(--muted);margin-right:5px">B.</span>bàn tay
-      </button><button class="qopt" data-correct="false" onclick="submitMC(this,false,'book','sách 📚')">
-        <span style="font-weight:800;color:var(--muted);margin-right:5px">C.</span>con chó
-      </button><button class="qopt" data-correct="true" onclick="submitMC(this,true,'book','sách 📚')">
-        <span style="font-weight:800;color:var(--muted);margin-right:5px">D.</span>sách
-      </button>
-  </div></div>
-       <div class="quiz-fb" id="qfb"></div>
-     </div></div>
+  <div id="quizArea"></div>
 </div>
 
 <!-- ══ PRACTICE ══ -->
@@ -1414,19 +838,23 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
       <div class="page-title" style="font-size:1.3rem;margin-bottom:2px">🎤 Luyện tập</div>
       <div class="page-sub" style="margin-bottom:0">Nghe · Nói · Dịch theo cả 2 chiều</div>
     </div>
-    <span id="prac-level-badge" style="background: var(--c1)22; color: var(--c1); border-radius: 8px; padding: 5px 14px; font-size: 0.78rem; font-weight: 800;">📊 A1</span>
+    <span id="prac-level-badge"
+      style="background:var(--blue-bg);color:var(--blue);border-radius:8px;
+             padding:5px 14px;font-size:.78rem;font-weight:800">📊 A1</span>
   </div>
 
   <!-- Part selector -->
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px" id="prac-part-selector">
-    <div class="prac-part-card" id="ppart-1" onclick="startPractice(1)" style="background:linear-gradient(135deg,#eff6ff,#dbeafe);border:2px solid #93c5fd;
+    <div class="prac-part-card" id="ppart-1" onclick="startPractice(1)"
+      style="background:linear-gradient(135deg,#eff6ff,#dbeafe);border:2px solid #93c5fd;
              border-radius:14px;padding:18px 14px;cursor:pointer;transition:all .2s;text-align:center">
       <div style="font-size:1.6rem;font-weight:900;color:var(--blue);margin-bottom:6px;letter-spacing:2px">EN → VI</div>
       <div style="font-size:.95rem;font-weight:800;color:var(--blue);margin-bottom:4px">Phần 1</div>
       <div style="font-size:.8rem;font-weight:700;color:var(--ink);margin-bottom:4px">Anh → Việt</div>
       <div style="font-size:.72rem;color:var(--muted);line-height:1.5">App đưa câu tiếng Anh<br>Bạn trả lời tiếng Việt</div>
     </div>
-    <div class="prac-part-card" id="ppart-2" onclick="startPractice(2)" style="background:linear-gradient(135deg,#f0fdf4,#d1fae5);border:2px solid #6ee7b7;
+    <div class="prac-part-card" id="ppart-2" onclick="startPractice(2)"
+      style="background:linear-gradient(135deg,#f0fdf4,#d1fae5);border:2px solid #6ee7b7;
              border-radius:14px;padding:18px 14px;cursor:pointer;transition:all .2s;text-align:center">
       <div style="font-size:1.6rem;font-weight:900;color:var(--green);margin-bottom:6px;letter-spacing:2px">VI → EN</div>
       <div style="font-size:.95rem;font-weight:800;color:var(--green);margin-bottom:4px">Phần 2</div>
@@ -1440,12 +868,15 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
     <!-- Top bar: part label + topic + progress -->
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <span id="prac-part-label" style="font-size:.8rem;font-weight:800;padding:5px 14px;border-radius:20px;
+      <span id="prac-part-label"
+        style="font-size:.8rem;font-weight:800;padding:5px 14px;border-radius:20px;
                background:var(--blue);color:#fff;white-space:nowrap">Phần 1 — Anh → Việt</span>
-      <select id="pracTopicSel" onchange="onPracTopicChange(this.value)" style="flex:1;min-width:140px;border:1.5px solid var(--border);border-radius:10px;
+      <select id="pracTopicSel" onchange="onPracTopicChange(this.value)"
+        style="flex:1;min-width:140px;border:1.5px solid var(--border);border-radius:10px;
                padding:7px 12px;font-family:'Nunito',sans-serif;font-size:.8rem;font-weight:700;
                color:var(--ink);background:var(--card);outline:none;cursor:pointer"></select>
-      <button onclick="stopPractice()" style="padding:6px 14px;border-radius:10px;border:1.5px solid var(--border);
+      <button onclick="stopPractice()"
+        style="padding:6px 14px;border-radius:10px;border:1.5px solid var(--border);
                background:var(--card);font-family:'Nunito',sans-serif;font-size:.76rem;
                font-weight:700;color:var(--muted);cursor:pointer;white-space:nowrap">✕ Thoát</button>
     </div>
@@ -1454,17 +885,20 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
     <div style="display:flex;gap:8px;margin-bottom:14px">
       <div style="flex:1;background:var(--green-bg);border:1px solid var(--green2);border-radius:10px;
                   padding:9px;text-align:center">
-        <div style="font-family:'Baloo 2',cursive;font-size:1.3rem;font-weight:800;color:var(--green)" id="prac-correct">0</div>
+        <div style="font-family:'Baloo 2',cursive;font-size:1.3rem;font-weight:800;color:var(--green)"
+             id="prac-correct">0</div>
         <div style="font-size:.65rem;font-weight:700;color:var(--green)">Đúng</div>
       </div>
       <div style="flex:1;background:var(--pink-bg);border:1px solid var(--pink2);border-radius:10px;
                   padding:9px;text-align:center">
-        <div style="font-family:'Baloo 2',cursive;font-size:1.3rem;font-weight:800;color:var(--pink)" id="prac-wrong">0</div>
+        <div style="font-family:'Baloo 2',cursive;font-size:1.3rem;font-weight:800;color:var(--pink)"
+             id="prac-wrong">0</div>
         <div style="font-size:.65rem;font-weight:700;color:var(--pink)">Sai</div>
       </div>
       <div style="flex:1;background:var(--blue-bg);border:1px solid var(--blue2);border-radius:10px;
                   padding:9px;text-align:center">
-        <div style="font-family:'Baloo 2',cursive;font-size:1.3rem;font-weight:800;color:var(--blue)" id="prac-streak">0</div>
+        <div style="font-family:'Baloo 2',cursive;font-size:1.3rem;font-weight:800;color:var(--blue)"
+             id="prac-streak">0</div>
         <div style="font-size:.65rem;font-weight:700;color:var(--blue)">Streak 🔥</div>
       </div>
       <div style="flex:2;background:var(--card);border:1px solid var(--border);border-radius:10px;
@@ -1473,7 +907,8 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
           <span>Tiến độ</span><span id="prac-idx-lbl">0 / 0</span>
         </div>
         <div style="height:8px;background:var(--light);border-radius:4px;overflow:hidden">
-          <div id="prac-prog-fill" style="height:100%;background:linear-gradient(90deg,var(--blue),var(--purple2));
+          <div id="prac-prog-fill"
+            style="height:100%;background:linear-gradient(90deg,var(--blue),var(--purple2));
                    border-radius:4px;transition:width .4s;width:0%"></div>
         </div>
       </div>
@@ -1485,19 +920,24 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
         <!-- Direction indicator -->
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-          <span id="prac-dir-badge" style="font-size:.7rem;font-weight:800;padding:3px 10px;border-radius:12px;
+          <span id="prac-dir-badge"
+            style="font-size:.7rem;font-weight:800;padding:3px 10px;border-radius:12px;
                    background:var(--blue-bg);color:var(--blue)">🇬🇧 Tiếng Anh</span>
-          <button id="prac-speak-q" onclick="pracSpeakQuestion()" style="background:none;border:1.5px solid var(--border);border-radius:8px;
+          <button id="prac-speak-q" onclick="pracSpeakQuestion()"
+            style="background:none;border:1.5px solid var(--border);border-radius:8px;
                    padding:4px 12px;font-size:.75rem;cursor:pointer;color:var(--blue);
                    font-family:'Nunito',sans-serif;font-weight:700">🔊 Nghe</button>
         </div>
 
         <!-- Question sentence -->
-        <div id="prac-question" style="font-family:'Baloo 2',cursive;font-size:1.5rem;font-weight:800;
+        <div id="prac-question"
+          style="font-family:'Baloo 2',cursive;font-size:1.5rem;font-weight:800;
                  color:var(--ink);text-align:center;line-height:1.4;margin-bottom:6px">—</div>
-        <div id="prac-question-sub" style="font-size:.78rem;color:var(--muted);text-align:center;font-style:italic;
+        <div id="prac-question-sub"
+          style="font-size:.78rem;color:var(--muted);text-align:center;font-style:italic;
                  margin-bottom:4px"></div>
-        <div id="prac-topic-word" style="font-size:.7rem;font-weight:700;color:var(--text3);text-align:center"></div>
+        <div id="prac-topic-word"
+          style="font-size:.7rem;font-weight:700;color:var(--text3);text-align:center"></div>
       </div>
     </div>
 
@@ -1506,7 +946,8 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
       <div style="padding:14px 16px">
 
         <!-- Answer direction hint -->
-        <div id="prac-ans-hint" style="font-size:.75rem;font-weight:700;color:var(--muted);margin-bottom:10px;
+        <div id="prac-ans-hint"
+          style="font-size:.75rem;font-weight:700;color:var(--muted);margin-bottom:10px;
                  display:flex;align-items:center;gap:6px">
           <span id="prac-ans-flag">🇻🇳</span>
           <span id="prac-ans-label">Trả lời bằng tiếng Việt:</span>
@@ -1516,21 +957,25 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
         <div style="display:flex;flex-direction:column;align-items:center;gap:10px;
                     padding:14px;background:var(--light);border-radius:12px;
                     border:1.5px dashed var(--border);margin-bottom:12px">
-          <button id="pracMicBtn" onclick="togglePracMic()" style="width:64px;height:64px;border-radius:50%;background:var(--pink);
+          <button id="pracMicBtn" onclick="togglePracMic()"
+            style="width:64px;height:64px;border-radius:50%;background:var(--pink);
                    border:none;color:#fff;font-size:1.6rem;cursor:pointer;
                    transition:all .2s;box-shadow:0 4px 16px rgba(219,39,119,.35)">🎤</button>
-          <div id="pracMicStatus" style="font-size:.78rem;font-weight:700;color:var(--muted);text-align:center">
+          <div id="pracMicStatus"
+            style="font-size:.78rem;font-weight:700;color:var(--muted);text-align:center">
             Nhấn 🎤 để trả lời bằng giọng nói
           </div>
           <!-- Wave bars -->
-          <div id="pracWave" style="display:flex;gap:3px;align-items:center;height:28px;opacity:0;transition:opacity .3s">
+          <div id="pracWave"
+            style="display:flex;gap:3px;align-items:center;height:28px;opacity:0;transition:opacity .3s">
             <div class="wb" style="background:var(--pink)"></div>
             <div class="wb" style="background:var(--pink)"></div>
             <div class="wb" style="background:var(--pink)"></div>
             <div class="wb" style="background:var(--pink)"></div>
             <div class="wb" style="background:var(--pink)"></div>
           </div>
-          <div id="pracInterim" style="font-size:.85rem;color:var(--blue);font-style:italic;min-height:20px;
+          <div id="pracInterim"
+            style="font-size:.85rem;color:var(--blue);font-style:italic;min-height:20px;
                    text-align:center;font-weight:600"></div>
         </div>
 
@@ -1543,11 +988,17 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
         <!-- Type input -->
         <div style="display:flex;gap:8px">
-          <input id="pracTypeInput" type="text" placeholder="Nhập câu trả lời..." onkeydown="if(event.key==='Enter')checkPracAnswer()" style="flex:1;border:2px solid var(--border);border-radius:10px;
+          <input id="pracTypeInput" type="text"
+            placeholder="Nhập câu trả lời..."
+            onkeydown="if(event.key==='Enter')checkPracAnswer()"
+            style="flex:1;border:2px solid var(--border);border-radius:10px;
                    padding:11px 14px;font-size:.9rem;font-family:'Nunito',sans-serif;
                    font-weight:600;color:var(--ink);outline:none;background:var(--card);
-                   transition:border-color .15s" onfocus="this.style.borderColor='var(--blue2)'" onblur="this.style.borderColor='var(--border)'">
-          <button onclick="checkPracAnswer()" style="padding:11px 18px;border-radius:10px;background:var(--blue);
+                   transition:border-color .15s"
+            onfocus="this.style.borderColor='var(--blue2)'"
+            onblur="this.style.borderColor='var(--border)'">
+          <button onclick="checkPracAnswer()"
+            style="padding:11px 18px;border-radius:10px;background:var(--blue);
                    color:#fff;border:none;font-size:.88rem;font-weight:800;
                    cursor:pointer;font-family:'Nunito',sans-serif;white-space:nowrap">
             ✓ Kiểm tra
@@ -1560,15 +1011,18 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
     <div id="prac-feedback" style="display:none;margin-bottom:12px">
       <div class="card">
         <div style="padding:14px 16px">
-          <div id="prac-fb-verdict" style="font-size:1rem;font-weight:800;margin-bottom:10px;text-align:center"></div>
+          <div id="prac-fb-verdict"
+            style="font-size:1rem;font-weight:800;margin-bottom:10px;text-align:center"></div>
 
           <!-- Correct answer reveal -->
           <div style="background:var(--light);border-radius:10px;padding:12px 14px;margin-bottom:10px">
             <div style="font-size:.7rem;font-weight:700;color:var(--muted);margin-bottom:5px">
               ✅ Đáp án đúng:</div>
-            <div id="prac-fb-correct" style="font-family:'Baloo 2',cursive;font-size:1.2rem;font-weight:800;
+            <div id="prac-fb-correct"
+              style="font-family:'Baloo 2',cursive;font-size:1.2rem;font-weight:800;
                      color:var(--green);margin-bottom:4px"></div>
-            <div id="prac-fb-correct-sub" style="font-size:.78rem;color:var(--muted);font-style:italic"></div>
+            <div id="prac-fb-correct-sub"
+              style="font-size:.78rem;color:var(--muted);font-style:italic"></div>
           </div>
 
           <!-- User answer -->
@@ -1579,12 +1033,14 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
           <!-- Speak correct answer -->
           <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
-            <button id="prac-fb-speak" style="padding:7px 16px;border-radius:10px;border:1.5px solid var(--green2);
+            <button id="prac-fb-speak"
+              style="padding:7px 16px;border-radius:10px;border:1.5px solid var(--green2);
                      background:var(--green-bg);color:var(--green);font-family:'Nunito',sans-serif;
                      font-size:.8rem;font-weight:800;cursor:pointer">
               🔊 Nghe đáp án
             </button>
-            <button onclick="nextPracQuestion()" style="padding:7px 20px;border-radius:10px;background:var(--blue);color:#fff;
+            <button onclick="nextPracQuestion()"
+              style="padding:7px 20px;border-radius:10px;background:var(--blue);color:#fff;
                      border:none;font-family:'Nunito',sans-serif;font-size:.88rem;
                      font-weight:800;cursor:pointer">
               Câu tiếp theo →
@@ -1596,7 +1052,8 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
     <!-- Skip button (visible before answering) -->
     <div id="prac-skip-row" style="text-align:center;margin-bottom:8px">
-      <button onclick="skipPracQuestion()" style="padding:7px 20px;border-radius:10px;border:1.5px solid var(--border);
+      <button onclick="skipPracQuestion()"
+        style="padding:7px 20px;border-radius:10px;border:1.5px solid var(--border);
                background:var(--card);color:var(--muted);font-family:'Nunito',sans-serif;
                font-size:.78rem;font-weight:700;cursor:pointer">
         ⏭ Bỏ qua
@@ -1614,7 +1071,7 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:16px">
       <div>
         <div class="page-title" style="font-size:1.3rem;margin-bottom:2px">📝 Đề thi</div>
-        <div class="page-sub" style="margin-bottom:0">Làm bài theo chuẩn CEFR — có chấm điểm &amp; nhận xét</div>
+        <div class="page-sub" style="margin-bottom:0">Làm bài theo chuẩn CEFR — có chấm điểm & nhận xét</div>
       </div>
       <!-- Level filter -->
       <div style="display:flex;gap:6px;flex-wrap:wrap" id="exam-level-filter">
@@ -1626,259 +1083,9 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
       </div>
     </div>
 
-    <div id="examGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px"><div class="exam-card" onclick="openExam('a1-01')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 1</div>
-        <div class="exam-card-desc">Từ vựng, Ngữ pháp &amp; Đọc hiểu cơ bản</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📚 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-01')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-02')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 2</div>
-        <div class="exam-card-desc">Giao tiếp hàng ngày, Số đếm &amp; Màu sắc</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🎨 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-02')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-03')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 3</div>
-        <div class="exam-card-desc">Thời gian, Thức ăn &amp; Hoạt động hàng ngày</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🍎 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-03')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-04')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 4</div>
-        <div class="exam-card-desc">Địa điểm, Chỉ đường &amp; Tính từ mô tả</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📍 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-04')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a2-01')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--blue-bg);color:var(--c2)">A2</span>
-        <div class="exam-card-title">Đề thi A2 — Số 1</div>
-        <div class="exam-card-desc">Mua sắm, Giao tiếp &amp; Thì quá khứ đơn</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📚 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 40ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a2-01')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a2-02')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--blue-bg);color:var(--c2)">A2</span>
-        <div class="exam-card-title">Đề thi A2 — Số 2</div>
-        <div class="exam-card-desc">Du lịch, Sức khỏe &amp; So sánh tính từ</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✈️ mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 40ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a2-02')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-05')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 5</div>
-        <div class="exam-card-desc">Thể thao, Sở thích &amp; Động từ khuyết thiếu CAN</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">⚽ mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-05')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-06')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 6</div>
-        <div class="exam-card-desc">Công việc, Hoạt động hiện tại &amp; Thì hiện tại tiếp diễn</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">👩‍⚕️ mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-06')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-07')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 7</div>
-        <div class="exam-card-desc">Thời tiết, Mùa &amp; Thì tương lai với GOING TO</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🌤️ mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-07')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-08')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 8</div>
-        <div class="exam-card-desc">Nhà cửa, Đồ vật &amp; THERE IS / THERE ARE</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🏠 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-08')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-09')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 9</div>
-        <div class="exam-card-desc">Sinh hoạt hàng ngày &amp; Trạng từ chỉ tần suất</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">⏰ mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-09')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-10')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 10</div>
-        <div class="exam-card-desc">Quần áo &amp; Tính từ sở hữu / WHOSE</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">👕 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-10')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-11')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 11</div>
-        <div class="exam-card-desc">Môn học, Trường lớp &amp; Sở hữu cách ('s)</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📐 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-11')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-12')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 12</div>
-        <div class="exam-card-desc">Bộ phận cơ thể, Sức khỏe &amp; SHOULD/SHOULDN'T</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🩺 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-12')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-13')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 13</div>
-        <div class="exam-card-desc">Tháng, Ngày sinh nhật &amp; Số thứ tự (Ordinal Numbers)</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🎂 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-13')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-14')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 14</div>
-        <div class="exam-card-desc">Giao thông, Chỉ đường &amp; Câu mệnh lệnh (Imperatives)</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🚦 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-14')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-15')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 15</div>
-        <div class="exam-card-desc">Cảm xúc, Tính từ &amp; Thì quá khứ với WAS/WERE</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">😊 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-15')">▶ Bắt đầu</button>
-      </div>
-    </div><div class="exam-card" onclick="openExam('a1-16')">
-      <div class="exam-card-top">
-        
-        <span class="exam-card-lv" style="background:var(--green-bg);color:var(--c1)">A1</span>
-        <div class="exam-card-title">Đề thi A1 — Số 16</div>
-        <div class="exam-card-desc">Động vật, Thiên nhiên &amp; So sánh bằng (AS...AS)</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:10px">
-          <span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🦁 mc</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">✏️ short</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">📖 reading</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔗 match</span><span style="font-size:.65rem;font-weight:700;background:var(--light);border:1px solid var(--border);border-radius:6px;padding:2px 7px;color:var(--muted)">🔀 order</span>
-        </div>
-      </div>
-      <div class="exam-card-footer">
-        <div class="exam-card-meta">⏱ 30ph &nbsp;·&nbsp; 📝 36 câu &nbsp;·&nbsp; 💯 100đ</div>
-        <button class="exam-card-start" onclick="event.stopPropagation();openExam('a1-16')">▶ Bắt đầu</button>
-      </div>
-    </div></div>
+    <div id="examGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">
+      <!-- injected by JS -->
+    </div>
   </div>
 
   <!-- ── EXAM TAKING VIEW ── -->
@@ -1886,24 +1093,29 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
     <!-- Header -->
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px">
-      <button onclick="exitExam()" style="padding:7px 14px;border-radius:10px;border:1.5px solid var(--border);
+      <button onclick="exitExam()"
+        style="padding:7px 14px;border-radius:10px;border:1.5px solid var(--border);
                background:var(--card);font-family:'Nunito',sans-serif;font-size:.78rem;
                font-weight:700;color:var(--muted);cursor:pointer;flex-shrink:0">← Quay lại</button>
       <div style="flex:1">
-        <div id="exam-take-title" style="font-family:'Baloo 2',cursive;font-size:1.1rem;font-weight:800;color:var(--ink)"></div>
+        <div id="exam-take-title"
+          style="font-family:'Baloo 2',cursive;font-size:1.1rem;font-weight:800;color:var(--ink)"></div>
         <div id="exam-take-meta" style="font-size:.72rem;color:var(--muted)"></div>
       </div>
       <!-- Timer -->
-      <div id="exam-timer" style="display:flex;align-items:center;gap:6px;background:var(--amber-bg);
+      <div id="exam-timer"
+        style="display:flex;align-items:center;gap:6px;background:var(--amber-bg);
                border:1.5px solid var(--amber2);border-radius:10px;padding:6px 14px">
         <span style="font-size:.9rem">⏱</span>
-        <span id="exam-timer-txt" style="font-family:'Baloo 2',cursive;font-size:1.1rem;font-weight:800;color:var(--amber)">30:00</span>
+        <span id="exam-timer-txt"
+          style="font-family:'Baloo 2',cursive;font-size:1.1rem;font-weight:800;color:var(--amber)">30:00</span>
       </div>
     </div>
 
     <!-- Progress bar -->
     <div style="background:var(--light);border-radius:6px;height:8px;margin-bottom:14px;overflow:hidden">
-      <div id="exam-prog-bar" style="height:100%;background:linear-gradient(90deg,var(--blue),var(--purple2));
+      <div id="exam-prog-bar"
+        style="height:100%;background:linear-gradient(90deg,var(--blue),var(--purple2));
                border-radius:6px;transition:width .3s;width:0%"></div>
     </div>
 
@@ -1912,7 +1124,8 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 
     <!-- Submit button -->
     <div style="text-align:center;margin:20px 0">
-      <button onclick="submitExam()" style="padding:13px 40px;border-radius:12px;background:var(--blue);color:#fff;
+      <button onclick="submitExam()"
+        style="padding:13px 40px;border-radius:12px;background:var(--blue);color:#fff;
                border:none;font-family:'Nunito',sans-serif;font-size:1rem;font-weight:800;
                cursor:pointer;box-shadow:0 4px 16px rgba(37,99,235,.35);transition:all .2s">
         📤 Nộp bài
@@ -1925,18 +1138,22 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
   <div id="exam-result-view" style="display:none">
 
     <!-- Score card -->
-    <div id="exam-score-card" style="border-radius:16px;padding:2rem;text-align:center;margin-bottom:16px;
+    <div id="exam-score-card"
+      style="border-radius:16px;padding:2rem;text-align:center;margin-bottom:16px;
              background:linear-gradient(135deg,#eff6ff,#dbeafe);border:2px solid #93c5fd">
       <div style="font-size:3.5rem;margin-bottom:8px" id="exam-res-emoji">🎉</div>
-      <div style="font-family:'Baloo 2',cursive;font-size:2rem;font-weight:800;color:var(--ink)" id="exam-res-score">0 / 100</div>
+      <div style="font-family:'Baloo 2',cursive;font-size:2rem;font-weight:800;color:var(--ink)"
+           id="exam-res-score">0 / 100</div>
       <div style="font-size:1rem;font-weight:800;margin:6px 0" id="exam-res-grade">A</div>
       <div style="font-size:.85rem;color:var(--muted)" id="exam-res-comment"></div>
       <div style="margin-top:14px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
-        <button onclick="retakeExam()" style="padding:10px 24px;border-radius:10px;background:var(--blue);color:#fff;
+        <button onclick="retakeExam()"
+          style="padding:10px 24px;border-radius:10px;background:var(--blue);color:#fff;
                  border:none;font-family:'Nunito',sans-serif;font-size:.88rem;font-weight:800;cursor:pointer">
           🔄 Làm lại
         </button>
-        <button onclick="exitExam()" style="padding:10px 24px;border-radius:10px;background:var(--card);color:var(--ink);
+        <button onclick="exitExam()"
+          style="padding:10px 24px;border-radius:10px;background:var(--card);color:var(--ink);
                  border:1.5px solid var(--border);font-family:'Nunito',sans-serif;font-size:.88rem;font-weight:800;cursor:pointer">
           ← Chọn đề khác
         </button>
@@ -1962,7 +1179,7 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
 <div id="panel-games" class="panel">
   <div id="game-menu">
     <div class="card" style="margin-bottom:14px">
-      <div class="card-header"><h3>🎮 Mini Games học từ vựng</h3><span id="game-level-badge" style="font-size: 0.72rem; font-weight: 800; background: var(--c1)22; color: var(--c1); border-radius: 8px; padding: 4px 10px;">📊 A1</span></div>
+      <div class="card-header"><h3>🎮 Mini Games học từ vựng</h3><span id="game-level-badge" style="font-size:.72rem;font-weight:800;background:var(--blue-bg);color:var(--blue);border-radius:8px;padding:4px 10px">📊 A1</span></div>
       <div class="card-body">
         <p style="font-size:.8rem;color:var(--muted);margin-bottom:12px;">Chọn game yêu thích để học từ vựng một cách vui vẻ!</p>
         <div class="game-grid">
@@ -1996,90 +1213,23 @@ header{background:var(--blue);color:#fff;padding:11px 16px;display:flex;align-it
   <div class="prog-grid">
     <div class="prog-stat"><div class="prog-num" style="color:var(--amber)">🔥 7</div><div class="prog-lbl">Ngày học liên tiếp</div></div>
     <div class="prog-stat"><div class="prog-num" id="pg-xp" style="color:var(--blue)">0</div><div class="prog-lbl">Tổng điểm XP</div></div>
-    <div class="prog-stat"><div class="prog-num" id="pg-words" style="color:var(--green)">280</div><div class="prog-lbl">Từ đã học</div></div>
+    <div class="prog-stat"><div class="prog-num" id="pg-words" style="color:var(--green)">0</div><div class="prog-lbl">Từ đã học</div></div>
     <div class="prog-stat"><div class="prog-num" id="pg-quiz" style="color:var(--purple)">0</div><div class="prog-lbl">Quiz hoàn thành</div></div>
   </div>
   <div class="card" style="margin-bottom:14px">
     <div class="card-header"><h3>📊 Kỹ năng</h3></div>
     <div class="card-body">
-      <div class="skill-bars" id="skillBars">
-    <div class="skill-bar-row">
-      <div class="skill-bar-lbl">🎧 Nghe</div>
-      <div class="skill-bar-track"><div class="skill-bar-fill" style="width:72%;background:var(--blue)"></div></div>
-      <div class="skill-bar-pct">72%</div>
-    </div>
-    <div class="skill-bar-row">
-      <div class="skill-bar-lbl">🎙 Nói</div>
-      <div class="skill-bar-track"><div class="skill-bar-fill" style="width:58%;background:var(--pink)"></div></div>
-      <div class="skill-bar-pct">58%</div>
-    </div>
-    <div class="skill-bar-row">
-      <div class="skill-bar-lbl">📖 Đọc</div>
-      <div class="skill-bar-track"><div class="skill-bar-fill" style="width:85%;background:var(--amber)"></div></div>
-      <div class="skill-bar-pct">85%</div>
-    </div>
-    <div class="skill-bar-row">
-      <div class="skill-bar-lbl">✏️ Viết</div>
-      <div class="skill-bar-track"><div class="skill-bar-fill" style="width:65%;background:var(--green)"></div></div>
-      <div class="skill-bar-pct">65%</div>
-    </div>
-    <div class="skill-bar-row">
-      <div class="skill-bar-lbl">📚 Từ vựng</div>
-      <div class="skill-bar-track"><div class="skill-bar-fill" style="width:40%;background:var(--purple)"></div></div>
-      <div class="skill-bar-pct">40%</div>
-    </div></div>
+      <div class="skill-bars" id="skillBars"></div>
     </div>
   </div>
   <div class="card">
     <div class="card-header"><h3>🏆 Thành tích</h3></div>
-    <div class="card-body" id="achievements">
-    <div class="achievement">
-      <div class="ach-icon">🌱</div>
-      <div class="ach-info">
-        <div class="ach-name">First Step </div>
-        <div class="ach-desc">Học từ đầu tiên</div>
-      </div>
-    </div>
-    <div class="achievement">
-      <div class="ach-icon">🔥</div>
-      <div class="ach-info">
-        <div class="ach-name">On Fire! </div>
-        <div class="ach-desc">Học 7 ngày liên tiếp</div>
-      </div>
-    </div>
-    <div class="achievement ach-locked">
-      <div class="ach-icon">📚</div>
-      <div class="ach-info">
-        <div class="ach-name">Bookworm 🔒</div>
-        <div class="ach-desc">Học 50 từ vựng</div>
-      </div>
-    </div>
-    <div class="achievement ach-locked">
-      <div class="ach-icon">🎯</div>
-      <div class="ach-info">
-        <div class="ach-name">Quiz Master 🔒</div>
-        <div class="ach-desc">Đạt 100% trong một bài quiz</div>
-      </div>
-    </div>
-    <div class="achievement ach-locked">
-      <div class="ach-icon">🎮</div>
-      <div class="ach-info">
-        <div class="ach-name">Game On 🔒</div>
-        <div class="ach-desc">Chơi 10 ván game</div>
-      </div>
-    </div>
-    <div class="achievement ach-locked">
-      <div class="ach-icon">⭐</div>
-      <div class="ach-info">
-        <div class="ach-name">Star Student 🔒</div>
-        <div class="ach-desc">Đạt 500 XP</div>
-      </div>
-    </div></div>
+    <div class="card-body" id="achievements"></div>
   </div>
 </div>
 
 <!-- ══ IMPORT ══ -->
-<div id="panel-import" class="panel active">
+<div id="panel-import" class="panel">
   <div class="card" style="margin-bottom:12px">
     <div class="card-header"><h3>📋 Format CSV để import từ vựng</h3></div>
     <div class="card-body">
@@ -2113,19 +1263,24 @@ travel,/ˈtrævl/,Du lịch,I love to travel.,Tôi thích du lịch.,<span style
   <div class="card" style="margin-bottom:12px">
     <div class="card-header"><h3>📤 Upload hoặc dán CSV</h3></div>
     <div class="card-body">
-      <div class="drop-zone" id="dropZone" onclick="document.getElementById('csvFile').click()" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="this.classList.remove('over')" ondrop="handleDrop(event)">
+      <div class="drop-zone" id="dropZone" onclick="document.getElementById('csvFile').click()"
+        ondragover="event.preventDefault();this.classList.add('over')"
+        ondragleave="this.classList.remove('over')"
+        ondrop="handleDrop(event)">
         <div style="font-size:2rem;margin-bottom:6px">📂</div>
         <div style="font-size:.86rem;font-weight:700;color:var(--ink);margin-bottom:3px">Kéo thả file CSV vào đây</div>
         <div style="font-size:.73rem;color:var(--muted)">hoặc nhấn để chọn file</div>
       </div>
       <input type="file" id="csvFile" accept=".csv,.txt" style="display:none" onchange="handleFileUpload(event)">
       <div style="text-align:center;margin:8px 0;color:var(--muted);font-size:.76rem">── hoặc dán trực tiếp ──</div>
-      <textarea id="csvPaste" rows="5" placeholder="Dán nội dung CSV vào đây...
-word,phonetic,vietnamese,example_en,example_vn,level,topic
-apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food" style="width:100%;border:1.5px solid var(--border);border-radius:10px;padding:10px 12px;font-family:monospace;font-size:.76rem;resize:vertical;outline:none;background:var(--light);line-height:1.6;color:var(--ink)" onfocus="this.style.borderColor='var(--blue2)'" onblur="this.style.borderColor='var(--border)'"></textarea>
-      <div id="importError" style="display: block; margin-top: 8px;" class="import-ok">✅ Đã import 80 từ thành công!</div>
-      <div id="importPreview" style="display: none; margin-top: 10px;">
-        <div style="font-size:.8rem;font-weight:800;color:var(--ink);margin-bottom:6px" id="previewTitle">👁 Xem trước — tìm thấy 80 từ</div>
+      <textarea id="csvPaste" rows="5"
+        placeholder="Dán nội dung CSV vào đây...&#10;word,phonetic,vietnamese,example_en,example_vn,level,topic&#10;apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food"
+        style="width:100%;border:1.5px solid var(--border);border-radius:10px;padding:10px 12px;font-family:monospace;font-size:.76rem;resize:vertical;outline:none;background:var(--light);line-height:1.6;color:var(--ink)"
+        onfocus="this.style.borderColor='var(--blue2)'"
+        onblur="this.style.borderColor='var(--border)'"></textarea>
+      <div id="importError" style="display:none;margin-top:8px"></div>
+      <div id="importPreview" style="display:none;margin-top:10px">
+        <div style="font-size:.8rem;font-weight:800;color:var(--ink);margin-bottom:6px" id="previewTitle">👁 Xem trước</div>
         <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;margin-bottom:10px">
           <table class="import-preview-table">
             <thead>
@@ -2133,67 +1288,7 @@ apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food" style="width:1
                 <th>Word</th><th>Phonetic</th><th>Vietnamese</th><th>Level</th><th>Topic</th>
               </tr>
             </thead>
-            <tbody id="previewBody">
-    <tr><td><strong>DESTINATION</strong></td><td style="color:var(--muted)">/ˌdestɪˈneɪʃən/</td><td>điểm đến</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>ITINERARY</strong></td><td style="color:var(--muted)">/aɪˈtɪnərəri/</td><td>lịch trình du lịch</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>ACCOMMODATION</strong></td><td style="color:var(--muted)">/əˌkɒməˈdeɪʃən/</td><td>chỗ ở</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>SIGHTSEEING</strong></td><td style="color:var(--muted)">/ˈsaɪtsiːɪŋ/</td><td>tham quan</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>LANDMARK</strong></td><td style="color:var(--muted)">/ˈlændmɑːrk/</td><td>địa danh nổi tiếng</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>TOURIST ATTRACTION</strong></td><td style="color:var(--muted)">/ˈtʊərɪst əˌtrækʃən/</td><td>điểm thu hút khách du lịch</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>DEPARTURE</strong></td><td style="color:var(--muted)">/dɪˈpɑːrtʃər/</td><td>khởi hành</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>ADVENTURE</strong></td><td style="color:var(--muted)">/ədˈventʃər/</td><td>cuộc phiêu lưu</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Travel &amp; Tourism</td></tr>
-    <tr><td><strong>SYMPTOM</strong></td><td style="color:var(--muted)">/ˈsɪmptəm/</td><td>triệu chứng</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>TREATMENT</strong></td><td style="color:var(--muted)">/ˈtriːtmənt/</td><td>điều trị</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>RECOVERY</strong></td><td style="color:var(--muted)">/rɪˈkʌvəri/</td><td>sự hồi phục</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>BALANCED DIET</strong></td><td style="color:var(--muted)">/ˌbælənst ˈdaɪət/</td><td>chế độ ăn cân bằng</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>IMMUNE SYSTEM</strong></td><td style="color:var(--muted)">/ɪˈmjuːn ˈsɪstəm/</td><td>hệ miễn dịch</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>MENTAL HEALTH</strong></td><td style="color:var(--muted)">/ˈmentl helθ/</td><td>sức khỏe tinh thần</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>NUTRITION</strong></td><td style="color:var(--muted)">/njuˈtrɪʃən/</td><td>dinh dưỡng</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>WELL-BEING</strong></td><td style="color:var(--muted)">/ˌwel ˈbiːɪŋ/</td><td>sức khỏe tổng thể</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Health &amp; Body</td></tr>
-    <tr><td><strong>PROFESSION</strong></td><td style="color:var(--muted)">/prəˈfeʃən/</td><td>nghề nghiệp</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Work &amp; Jobs</td></tr>
-    <tr><td><strong>COLLEAGUE</strong></td><td style="color:var(--muted)">/ˈkɒliːɡ/</td><td>đồng nghiệp</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Work &amp; Jobs</td></tr>
-    <tr><td><strong>PROMOTION</strong></td><td style="color:var(--muted)">/prəˈməʊʃən/</td><td>thăng chức</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Work &amp; Jobs</td></tr>
-    <tr><td><strong>RESPONSIBILITY</strong></td><td style="color:var(--muted)">/rɪˌspɒnsəˈbɪləti/</td><td>trách nhiệm</td>
-    <td><span style="background:var(--blue-bg);color:var(--blue);border-radius:6px;padding:2px 6px;font-size:.7rem;font-weight:700">B1</span></td>
-    <td style="color:var(--purple)">Work &amp; Jobs</td></tr></tbody>
+            <tbody id="previewBody"></tbody>
           </table>
         </div>
         <div style="display:flex;gap:8px">
@@ -2201,23 +1296,23 @@ apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food" style="width:1
           <button class="abtn" onclick="cancelImport()" style="flex:1;font-size:.86rem">✕ Hủy</button>
         </div>
       </div>
-      <button class="abtn pri" onclick="previewCSV()" style="width:100%;margin-top:10px;font-size:.88rem">🔍 Xem trước &amp; Import</button>
+      <button class="abtn pri" onclick="previewCSV()" style="width:100%;margin-top:10px;font-size:.88rem">🔍 Xem trước & Import</button>
     </div>
   </div>
 
   <div class="card" id="customVocabCard">
     <div class="card-header">
-      <h3>📚 Từ vựng đã import (<span id="customCount">80</span>)</h3>
-      <button class="abtn sm" onclick="clearImported()" id="clearImportBtn" style="">🗑 Xóa tất cả</button>
+      <h3>📚 Từ vựng đã import (<span id="customCount">0</span>)</h3>
+      <button class="abtn sm" onclick="clearImported()" id="clearImportBtn" style="display:none">🗑 Xóa tất cả</button>
     </div>
-    <div class="card-body" id="customVocabList"><span class="cv-chip"><span class="cv-word">DESTINATION</span><span style="color:var(--muted);font-size:.7rem">điểm đến</span><span class="cv-rm" onclick="removeCustomWord('destination')">✕</span></span><span class="cv-chip"><span class="cv-word">ITINERARY</span><span style="color:var(--muted);font-size:.7rem">lịch trình du l</span><span class="cv-rm" onclick="removeCustomWord('itinerary')">✕</span></span><span class="cv-chip"><span class="cv-word">ACCOMMODATION</span><span style="color:var(--muted);font-size:.7rem">chỗ ở</span><span class="cv-rm" onclick="removeCustomWord('accommodation')">✕</span></span><span class="cv-chip"><span class="cv-word">SIGHTSEEING</span><span style="color:var(--muted);font-size:.7rem">tham quan</span><span class="cv-rm" onclick="removeCustomWord('sightseeing')">✕</span></span><span class="cv-chip"><span class="cv-word">LANDMARK</span><span style="color:var(--muted);font-size:.7rem">địa danh nổi ti</span><span class="cv-rm" onclick="removeCustomWord('landmark')">✕</span></span><span class="cv-chip"><span class="cv-word">TOURIST ATTRACTION</span><span style="color:var(--muted);font-size:.7rem">điểm thu hút kh</span><span class="cv-rm" onclick="removeCustomWord('tourist attraction')">✕</span></span><span class="cv-chip"><span class="cv-word">DEPARTURE</span><span style="color:var(--muted);font-size:.7rem">khởi hành</span><span class="cv-rm" onclick="removeCustomWord('departure')">✕</span></span><span class="cv-chip"><span class="cv-word">ADVENTURE</span><span style="color:var(--muted);font-size:.7rem">cuộc phiêu lưu</span><span class="cv-rm" onclick="removeCustomWord('adventure')">✕</span></span><span class="cv-chip"><span class="cv-word">SYMPTOM</span><span style="color:var(--muted);font-size:.7rem">triệu chứng</span><span class="cv-rm" onclick="removeCustomWord('symptom')">✕</span></span><span class="cv-chip"><span class="cv-word">TREATMENT</span><span style="color:var(--muted);font-size:.7rem">điều trị</span><span class="cv-rm" onclick="removeCustomWord('treatment')">✕</span></span><span class="cv-chip"><span class="cv-word">RECOVERY</span><span style="color:var(--muted);font-size:.7rem">sự hồi phục</span><span class="cv-rm" onclick="removeCustomWord('recovery')">✕</span></span><span class="cv-chip"><span class="cv-word">BALANCED DIET</span><span style="color:var(--muted);font-size:.7rem">chế độ ăn cân b</span><span class="cv-rm" onclick="removeCustomWord('balanced diet')">✕</span></span><span class="cv-chip"><span class="cv-word">IMMUNE SYSTEM</span><span style="color:var(--muted);font-size:.7rem">hệ miễn dịch</span><span class="cv-rm" onclick="removeCustomWord('immune system')">✕</span></span><span class="cv-chip"><span class="cv-word">MENTAL HEALTH</span><span style="color:var(--muted);font-size:.7rem">sức khỏe tinh t</span><span class="cv-rm" onclick="removeCustomWord('mental health')">✕</span></span><span class="cv-chip"><span class="cv-word">NUTRITION</span><span style="color:var(--muted);font-size:.7rem">dinh dưỡng</span><span class="cv-rm" onclick="removeCustomWord('nutrition')">✕</span></span><span class="cv-chip"><span class="cv-word">WELL-BEING</span><span style="color:var(--muted);font-size:.7rem">sức khỏe tổng t</span><span class="cv-rm" onclick="removeCustomWord('well-being')">✕</span></span><span class="cv-chip"><span class="cv-word">PROFESSION</span><span style="color:var(--muted);font-size:.7rem">nghề nghiệp</span><span class="cv-rm" onclick="removeCustomWord('profession')">✕</span></span><span class="cv-chip"><span class="cv-word">COLLEAGUE</span><span style="color:var(--muted);font-size:.7rem">đồng nghiệp</span><span class="cv-rm" onclick="removeCustomWord('colleague')">✕</span></span><span class="cv-chip"><span class="cv-word">PROMOTION</span><span style="color:var(--muted);font-size:.7rem">thăng chức</span><span class="cv-rm" onclick="removeCustomWord('promotion')">✕</span></span><span class="cv-chip"><span class="cv-word">RESPONSIBILITY</span><span style="color:var(--muted);font-size:.7rem">trách nhiệm</span><span class="cv-rm" onclick="removeCustomWord('responsibility')">✕</span></span><span class="cv-chip"><span class="cv-word">QUALIFICATION</span><span style="color:var(--muted);font-size:.7rem">bằng cấp</span><span class="cv-rm" onclick="removeCustomWord('qualification')">✕</span></span><span class="cv-chip"><span class="cv-word">SALARY</span><span style="color:var(--muted);font-size:.7rem">mức lương</span><span class="cv-rm" onclick="removeCustomWord('salary')">✕</span></span><span class="cv-chip"><span class="cv-word">CAREER</span><span style="color:var(--muted);font-size:.7rem">sự nghiệp</span><span class="cv-rm" onclick="removeCustomWord('career')">✕</span></span><span class="cv-chip"><span class="cv-word">EMPLOYER</span><span style="color:var(--muted);font-size:.7rem">người sử dụng l</span><span class="cv-rm" onclick="removeCustomWord('employer')">✕</span></span><span class="cv-chip"><span class="cv-word">POLLUTION</span><span style="color:var(--muted);font-size:.7rem">ô nhiễm</span><span class="cv-rm" onclick="removeCustomWord('pollution')">✕</span></span><span class="cv-chip"><span class="cv-word">RECYCLE</span><span style="color:var(--muted);font-size:.7rem">tái chế</span><span class="cv-rm" onclick="removeCustomWord('recycle')">✕</span></span><span class="cv-chip"><span class="cv-word">RENEWABLE ENERGY</span><span style="color:var(--muted);font-size:.7rem">năng lượng tái </span><span class="cv-rm" onclick="removeCustomWord('renewable energy')">✕</span></span><span class="cv-chip"><span class="cv-word">CLIMATE CHANGE</span><span style="color:var(--muted);font-size:.7rem">biến đổi khí hậ</span><span class="cv-rm" onclick="removeCustomWord('climate change')">✕</span></span><span class="cv-chip"><span class="cv-word">CONSERVATION</span><span style="color:var(--muted);font-size:.7rem">bảo tồn</span><span class="cv-rm" onclick="removeCustomWord('conservation')">✕</span></span><span class="cv-chip"><span class="cv-word">ECOSYSTEM</span><span style="color:var(--muted);font-size:.7rem">hệ sinh thái</span><span class="cv-rm" onclick="removeCustomWord('ecosystem')">✕</span></span><span class="cv-chip"><span class="cv-word">NATURAL RESOURCE</span><span style="color:var(--muted);font-size:.7rem">tài nguyên thiê</span><span class="cv-rm" onclick="removeCustomWord('natural resource')">✕</span></span><span class="cv-chip"><span class="cv-word">SUSTAINABILITY</span><span style="color:var(--muted);font-size:.7rem">tính bền vững</span><span class="cv-rm" onclick="removeCustomWord('sustainability')">✕</span></span><span class="cv-chip"><span class="cv-word">INVESTMENT</span><span style="color:var(--muted);font-size:.7rem">đầu tư</span><span class="cv-rm" onclick="removeCustomWord('investment')">✕</span></span><span class="cv-chip"><span class="cv-word">REVENUE</span><span style="color:var(--muted);font-size:.7rem">doanh thu</span><span class="cv-rm" onclick="removeCustomWord('revenue')">✕</span></span><span class="cv-chip"><span class="cv-word">PROFIT</span><span style="color:var(--muted);font-size:.7rem">lợi nhuận</span><span class="cv-rm" onclick="removeCustomWord('profit')">✕</span></span><span class="cv-chip"><span class="cv-word">BUDGET</span><span style="color:var(--muted);font-size:.7rem">ngân sách</span><span class="cv-rm" onclick="removeCustomWord('budget')">✕</span></span><span class="cv-chip"><span class="cv-word">FINANCIAL RISK</span><span style="color:var(--muted);font-size:.7rem">rủi ro tài chín</span><span class="cv-rm" onclick="removeCustomWord('financial risk')">✕</span></span><span class="cv-chip"><span class="cv-word">SHAREHOLDER</span><span style="color:var(--muted);font-size:.7rem">cổ đông</span><span class="cv-rm" onclick="removeCustomWord('shareholder')">✕</span></span><span class="cv-chip"><span class="cv-word">ASSET</span><span style="color:var(--muted);font-size:.7rem">tài sản</span><span class="cv-rm" onclick="removeCustomWord('asset')">✕</span></span><span class="cv-chip"><span class="cv-word">CASH FLOW</span><span style="color:var(--muted);font-size:.7rem">dòng tiền</span><span class="cv-rm" onclick="removeCustomWord('cash flow')">✕</span></span><span class="cv-chip"><span class="cv-word">INNOVATION</span><span style="color:var(--muted);font-size:.7rem">đổi mới sáng tạ</span><span class="cv-rm" onclick="removeCustomWord('innovation')">✕</span></span><span class="cv-chip"><span class="cv-word">ARTIFICIAL INTELLIGENCE</span><span style="color:var(--muted);font-size:.7rem">trí tuệ nhân tạ</span><span class="cv-rm" onclick="removeCustomWord('artificial intelligence')">✕</span></span><span class="cv-chip"><span class="cv-word">ALGORITHM</span><span style="color:var(--muted);font-size:.7rem">thuật toán</span><span class="cv-rm" onclick="removeCustomWord('algorithm')">✕</span></span><span class="cv-chip"><span class="cv-word">CYBERSECURITY</span><span style="color:var(--muted);font-size:.7rem">an ninh mạng</span><span class="cv-rm" onclick="removeCustomWord('cybersecurity')">✕</span></span><span class="cv-chip"><span class="cv-word">DIGITAL PLATFORM</span><span style="color:var(--muted);font-size:.7rem">nền tảng số</span><span class="cv-rm" onclick="removeCustomWord('digital platform')">✕</span></span><span class="cv-chip"><span class="cv-word">AUTOMATION</span><span style="color:var(--muted);font-size:.7rem">tự động hóa</span><span class="cv-rm" onclick="removeCustomWord('automation')">✕</span></span><span class="cv-chip"><span class="cv-word">DATA PRIVACY</span><span style="color:var(--muted);font-size:.7rem">quyền riêng tư </span><span class="cv-rm" onclick="removeCustomWord('data privacy')">✕</span></span><span class="cv-chip"><span class="cv-word">VIRTUAL REALITY</span><span style="color:var(--muted);font-size:.7rem">thực tế ảo</span><span class="cv-rm" onclick="removeCustomWord('virtual reality')">✕</span></span><span class="cv-chip"><span class="cv-word">MOTIVATION</span><span style="color:var(--muted);font-size:.7rem">động lực</span><span class="cv-rm" onclick="removeCustomWord('motivation')">✕</span></span><span class="cv-chip"><span class="cv-word">SELF-ESTEEM</span><span style="color:var(--muted);font-size:.7rem">lòng tự trọng</span><span class="cv-rm" onclick="removeCustomWord('self-esteem')">✕</span></span><span class="cv-chip"><span class="cv-word">ANXIETY</span><span style="color:var(--muted);font-size:.7rem">lo âu</span><span class="cv-rm" onclick="removeCustomWord('anxiety')">✕</span></span><span class="cv-chip"><span class="cv-word">EMPATHY</span><span style="color:var(--muted);font-size:.7rem">sự đồng cảm</span><span class="cv-rm" onclick="removeCustomWord('empathy')">✕</span></span><span class="cv-chip"><span class="cv-word">PERCEPTION</span><span style="color:var(--muted);font-size:.7rem">nhận thức</span><span class="cv-rm" onclick="removeCustomWord('perception')">✕</span></span><span class="cv-chip"><span class="cv-word">PERSONALITY</span><span style="color:var(--muted);font-size:.7rem">tính cách</span><span class="cv-rm" onclick="removeCustomWord('personality')">✕</span></span><span class="cv-chip"><span class="cv-word">STRESS MANAGEMENT</span><span style="color:var(--muted);font-size:.7rem">quản lý căng th</span><span class="cv-rm" onclick="removeCustomWord('stress management')">✕</span></span><span class="cv-chip"><span class="cv-word">EMOTIONAL INTELLIGENCE</span><span style="color:var(--muted);font-size:.7rem">trí tuệ cảm xúc</span><span class="cv-rm" onclick="removeCustomWord('emotional intelligence')">✕</span></span><span class="cv-chip"><span class="cv-word">THESIS STATEMENT</span><span style="color:var(--muted);font-size:.7rem">luận đề</span><span class="cv-rm" onclick="removeCustomWord('thesis statement')">✕</span></span><span class="cv-chip"><span class="cv-word">CITATION</span><span style="color:var(--muted);font-size:.7rem">trích dẫn</span><span class="cv-rm" onclick="removeCustomWord('citation')">✕</span></span><span class="cv-chip"><span class="cv-word">COHERENCE</span><span style="color:var(--muted);font-size:.7rem">tính mạch lạc</span><span class="cv-rm" onclick="removeCustomWord('coherence')">✕</span></span><span class="cv-chip"><span class="cv-word">ARGUMENTATION</span><span style="color:var(--muted);font-size:.7rem">lập luận</span><span class="cv-rm" onclick="removeCustomWord('argumentation')">✕</span></span><span class="cv-chip"><span class="cv-word">METHODOLOGY</span><span style="color:var(--muted);font-size:.7rem">phương pháp ngh</span><span class="cv-rm" onclick="removeCustomWord('methodology')">✕</span></span><span class="cv-chip"><span class="cv-word">PARAPHRASE</span><span style="color:var(--muted);font-size:.7rem">diễn đạt lại</span><span class="cv-rm" onclick="removeCustomWord('paraphrase')">✕</span></span><span class="cv-chip"><span class="cv-word">ACADEMIC JOURNAL</span><span style="color:var(--muted);font-size:.7rem">tạp chí học thu</span><span class="cv-rm" onclick="removeCustomWord('academic journal')">✕</span></span><span class="cv-chip"><span class="cv-word">LITERATURE REVIEW</span><span style="color:var(--muted);font-size:.7rem">tổng quan tài l</span><span class="cv-rm" onclick="removeCustomWord('literature review')">✕</span></span><span class="cv-chip"><span class="cv-word">LEGISLATION</span><span style="color:var(--muted);font-size:.7rem">luật pháp</span><span class="cv-rm" onclick="removeCustomWord('legislation')">✕</span></span><span class="cv-chip"><span class="cv-word">JUSTICE</span><span style="color:var(--muted);font-size:.7rem">công lý</span><span class="cv-rm" onclick="removeCustomWord('justice')">✕</span></span><span class="cv-chip"><span class="cv-word">CONSTITUTIONAL RIGHTS</span><span style="color:var(--muted);font-size:.7rem">quyền hiến định</span><span class="cv-rm" onclick="removeCustomWord('constitutional rights')">✕</span></span><span class="cv-chip"><span class="cv-word">DISCRIMINATION</span><span style="color:var(--muted);font-size:.7rem">sự phân biệt đố</span><span class="cv-rm" onclick="removeCustomWord('discrimination')">✕</span></span><span class="cv-chip"><span class="cv-word">PUBLIC POLICY</span><span style="color:var(--muted);font-size:.7rem">chính sách công</span><span class="cv-rm" onclick="removeCustomWord('public policy')">✕</span></span><span class="cv-chip"><span class="cv-word">CIVIL LIBERTY</span><span style="color:var(--muted);font-size:.7rem">quyền tự do dân</span><span class="cv-rm" onclick="removeCustomWord('civil liberty')">✕</span></span><span class="cv-chip"><span class="cv-word">LEGAL SYSTEM</span><span style="color:var(--muted);font-size:.7rem">hệ thống pháp l</span><span class="cv-rm" onclick="removeCustomWord('legal system')">✕</span></span><span class="cv-chip"><span class="cv-word">SOCIAL JUSTICE</span><span style="color:var(--muted);font-size:.7rem">công bằng xã hộ</span><span class="cv-rm" onclick="removeCustomWord('social justice')">✕</span></span><span class="cv-chip"><span class="cv-word">MORALITY</span><span style="color:var(--muted);font-size:.7rem">đạo đức</span><span class="cv-rm" onclick="removeCustomWord('morality')">✕</span></span><span class="cv-chip"><span class="cv-word">ETHICAL DILEMMA</span><span style="color:var(--muted);font-size:.7rem">tình huống tiến</span><span class="cv-rm" onclick="removeCustomWord('ethical dilemma')">✕</span></span><span class="cv-chip"><span class="cv-word">VIRTUE</span><span style="color:var(--muted);font-size:.7rem">đức hạnh</span><span class="cv-rm" onclick="removeCustomWord('virtue')">✕</span></span><span class="cv-chip"><span class="cv-word">FREE WILL</span><span style="color:var(--muted);font-size:.7rem">ý chí tự do</span><span class="cv-rm" onclick="removeCustomWord('free will')">✕</span></span><span class="cv-chip"><span class="cv-word">CONSCIOUSNESS</span><span style="color:var(--muted);font-size:.7rem">ý thức</span><span class="cv-rm" onclick="removeCustomWord('consciousness')">✕</span></span><span class="cv-chip"><span class="cv-word">JUSTICE THEORY</span><span style="color:var(--muted);font-size:.7rem">học thuyết công</span><span class="cv-rm" onclick="removeCustomWord('justice theory')">✕</span></span><span class="cv-chip"><span class="cv-word">MORAL RESPONSIBILITY</span><span style="color:var(--muted);font-size:.7rem">trách nhiệm đạo</span><span class="cv-rm" onclick="removeCustomWord('moral responsibility')">✕</span></span><span class="cv-chip"><span class="cv-word">ETHICAL PRINCIPLE</span><span style="color:var(--muted);font-size:.7rem">nguyên tắc đạo </span><span class="cv-rm" onclick="removeCustomWord('ethical principle')">✕</span></span></div>
+    <div class="card-body" id="customVocabList"><p style="font-size:.8rem;color:var(--muted)">Chưa có từ vựng nào được import.</p></div>
   </div>
 
   <!-- ══ EXPORT & SYNC CARD ══ -->
   <div class="card">
     <div class="card-header">
-      <h3>📤 Xuất &amp; Đồng bộ dữ liệu</h3>
-      <span id="exportWordCount" style="font-size:.72rem;color:var(--muted)">80 từ đã import</span>
+      <h3>📤 Xuất & Đồng bộ dữ liệu</h3>
+      <span id="exportWordCount" style="font-size:.72rem;color:var(--muted)">0 từ đã import</span>
     </div>
     <div class="card-body">
 
@@ -2246,8 +1341,9 @@ apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food" style="width:1
               chứa tất cả từ vựng bạn đã import. Upload file này lên GitHub thay file cũ — 
               mọi thiết bị mở link GitHub đều thấy đủ data.
             </div>
-            <button class="abtn pri" onclick="exportFullHTML()" style="font-size:.84rem;width:100%;justify-content:center">
-              ⬇️ Xuất HTML (bao gồm <span id="htmlExportCount">80</span> từ đã import)
+            <button class="abtn pri" onclick="exportFullHTML()"
+              style="font-size:.84rem;width:100%;justify-content:center">
+              ⬇️ Xuất HTML (bao gồm <span id="htmlExportCount">0</span> từ đã import)
             </button>
           </div>
         </div>
@@ -2268,14 +1364,17 @@ apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food" style="width:1
               Có thể lưu file JSON lên Google Drive / GitHub để chia sẻ.
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="abtn green" onclick="exportJSON()" style="font-size:.82rem;flex:1;justify-content:center;min-width:120px">
-                ⬇️ Xuất JSON (<span id="jsonExportCount">80</span> từ)
+              <button class="abtn green" onclick="exportJSON()"
+                style="font-size:.82rem;flex:1;justify-content:center;min-width:120px">
+                ⬇️ Xuất JSON (<span id="jsonExportCount">0</span> từ)
               </button>
-              <button class="abtn" onclick="document.getElementById('jsonFileInput').click()" style="font-size:.82rem;flex:1;justify-content:center;min-width:120px;
+              <button class="abtn" onclick="document.getElementById('jsonFileInput').click()"
+                style="font-size:.82rem;flex:1;justify-content:center;min-width:120px;
                        border-color:var(--green2);color:var(--green)">
                 📥 Nhập JSON
               </button>
-              <input type="file" id="jsonFileInput" accept=".json" style="display:none" onchange="importFromJSON(event)">
+              <input type="file" id="jsonFileInput" accept=".json" style="display:none"
+                onchange="importFromJSON(event)">
             </div>
           </div>
         </div>
@@ -2288,10 +1387,13 @@ apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food" style="width:1
           📋 Hoặc dán nội dung JSON trực tiếp
         </summary>
         <div style="margin-top:8px">
-          <textarea id="jsonPasteArea" rows="5" placeholder="Dán nội dung JSON vào đây...
-[{&quot;w&quot;:&quot;apple&quot;,&quot;ph&quot;:&quot;/ˈæpl/&quot;,&quot;v&quot;:&quot;quả táo&quot;,&quot;ex&quot;:&quot;...&quot;,&quot;lv&quot;:&quot;A1&quot;,&quot;topic&quot;:&quot;Food&quot;}]" style="width:100%;border:1.5px solid var(--border);border-radius:10px;
+          <textarea id="jsonPasteArea" rows="5"
+            placeholder='Dán nội dung JSON vào đây...&#10;[{"w":"apple","ph":"/ˈæpl/","v":"quả táo","ex":"...","lv":"A1","topic":"Food"}]'
+            style="width:100%;border:1.5px solid var(--border);border-radius:10px;
                    padding:10px 12px;font-family:monospace;font-size:.74rem;
-                   resize:vertical;outline:none;background:var(--light);line-height:1.6;color:var(--ink)" onfocus="this.style.borderColor='var(--green2)'" onblur="this.style.borderColor='var(--border)'"></textarea>
+                   resize:vertical;outline:none;background:var(--light);line-height:1.6;color:var(--ink)"
+            onfocus="this.style.borderColor='var(--green2)'"
+            onblur="this.style.borderColor='var(--border)'"></textarea>
           <button class="abtn green" onclick="importFromJSONText()" style="margin-top:8px;font-size:.82rem">
             📥 Import từ JSON đã dán
           </button>
@@ -2299,7 +1401,8 @@ apple,/ˈæpl/,Quả táo,I eat an apple.,Tôi ăn táo.,A1,Food" style="width:1
       </details>
 
       <!-- Status message -->
-      <div id="exportStatus" style="display: block; margin-top: 8px; padding: 9px 13px; border-radius: 9px; font-size: 0.78rem; font-weight: 700; background: var(--green-bg); color: rgb(6, 95, 70); border: 1px solid var(--green2);">⏳ Đang chuẩn bị file HTML...</div>
+      <div id="exportStatus" style="display:none;margin-top:8px;padding:9px 13px;
+           border-radius:9px;font-size:.78rem;font-weight:700"></div>
     </div>
   </div>
 </div>
@@ -2697,7 +1800,7 @@ let fcTopic         = 'A1 · Greetings'; let fcIdx = 0;
 let totalXP         = 0; let totalWords = 0; let totalQuiz = 0;
 let totalCorrect    = 0; let totalAnswers = 0;
 let autoSpeak       = false; let micOn = false; let recognition = null;
-let customVocab = [{"w":"destination","ph":"/ˌdestɪˈneɪʃən/","v":"điểm đến","ex":"Thailand is a popular destination.","exv":"Thái Lan là điểm đến phổ biến.","lv":"B1","topic":"Travel & Tourism"},{"w":"itinerary","ph":"/aɪˈtɪnərəri/","v":"lịch trình du lịch","ex":"Our itinerary includes three cities.","exv":"Lịch trình của chúng tôi gồm ba thành phố.","lv":"B1","topic":"Travel & Tourism"},{"w":"accommodation","ph":"/əˌkɒməˈdeɪʃən/","v":"chỗ ở","ex":"We booked accommodation online.","exv":"Chúng tôi đặt chỗ ở trực tuyến.","lv":"B1","topic":"Travel & Tourism"},{"w":"sightseeing","ph":"/ˈsaɪtsiːɪŋ/","v":"tham quan","ex":"We spent the day sightseeing.","exv":"Chúng tôi dành cả ngày để tham quan.","lv":"B1","topic":"Travel & Tourism"},{"w":"landmark","ph":"/ˈlændmɑːrk/","v":"địa danh nổi tiếng","ex":"The Eiffel Tower is a famous landmark.","exv":"Tháp Eiffel là địa danh nổi tiếng.","lv":"B1","topic":"Travel & Tourism"},{"w":"tourist attraction","ph":"/ˈtʊərɪst əˌtrækʃən/","v":"điểm thu hút khách du lịch","ex":"The museum is a major tourist attraction.","exv":"Bảo tàng là điểm thu hút khách du lịch lớn.","lv":"B1","topic":"Travel & Tourism"},{"w":"departure","ph":"/dɪˈpɑːrtʃər/","v":"khởi hành","ex":"Please arrive before departure time.","exv":"Vui lòng đến trước giờ khởi hành.","lv":"B1","topic":"Travel & Tourism"},{"w":"adventure","ph":"/ədˈventʃər/","v":"cuộc phiêu lưu","ex":"Traveling alone can be an adventure.","exv":"Du lịch một mình có thể là một cuộc phiêu lưu.","lv":"B1","topic":"Travel & Tourism"},{"w":"symptom","ph":"/ˈsɪmptəm/","v":"triệu chứng","ex":"Fever is a common symptom.","exv":"Sốt là một triệu chứng phổ biến.","lv":"B1","topic":"Health & Body"},{"w":"treatment","ph":"/ˈtriːtmənt/","v":"điều trị","ex":"The treatment lasted two weeks.","exv":"Việc điều trị kéo dài hai tuần.","lv":"B1","topic":"Health & Body"},{"w":"recovery","ph":"/rɪˈkʌvəri/","v":"sự hồi phục","ex":"Her recovery was very fast.","exv":"Cô ấy hồi phục rất nhanh.","lv":"B1","topic":"Health & Body"},{"w":"balanced diet","ph":"/ˌbælənst ˈdaɪət/","v":"chế độ ăn cân bằng","ex":"A balanced diet improves health.","exv":"Chế độ ăn cân bằng cải thiện sức khỏe.","lv":"B1","topic":"Health & Body"},{"w":"immune system","ph":"/ɪˈmjuːn ˈsɪstəm/","v":"hệ miễn dịch","ex":"Exercise supports the immune system.","exv":"Tập thể dục hỗ trợ hệ miễn dịch.","lv":"B1","topic":"Health & Body"},{"w":"mental health","ph":"/ˈmentl helθ/","v":"sức khỏe tinh thần","ex":"Mental health is important for everyone.","exv":"Sức khỏe tinh thần quan trọng với mọi người.","lv":"B1","topic":"Health & Body"},{"w":"nutrition","ph":"/njuˈtrɪʃən/","v":"dinh dưỡng","ex":"Good nutrition helps children grow.","exv":"Dinh dưỡng tốt giúp trẻ phát triển.","lv":"B1","topic":"Health & Body"},{"w":"well-being","ph":"/ˌwel ˈbiːɪŋ/","v":"sức khỏe tổng thể","ex":"Regular exercise improves well-being.","exv":"Tập thể dục thường xuyên cải thiện sức khỏe tổng thể.","lv":"B1","topic":"Health & Body"},{"w":"profession","ph":"/prəˈfeʃən/","v":"nghề nghiệp","ex":"Teaching is a rewarding profession.","exv":"Dạy học là một nghề đáng giá.","lv":"B1","topic":"Work & Jobs"},{"w":"colleague","ph":"/ˈkɒliːɡ/","v":"đồng nghiệp","ex":"I often work with my colleagues.","exv":"Tôi thường làm việc với đồng nghiệp.","lv":"B1","topic":"Work & Jobs"},{"w":"promotion","ph":"/prəˈməʊʃən/","v":"thăng chức","ex":"She received a promotion last year.","exv":"Cô ấy được thăng chức năm ngoái.","lv":"B1","topic":"Work & Jobs"},{"w":"responsibility","ph":"/rɪˌspɒnsəˈbɪləti/","v":"trách nhiệm","ex":"Managing projects is a big responsibility.","exv":"Quản lý dự án là trách nhiệm lớn.","lv":"B1","topic":"Work & Jobs"},{"w":"qualification","ph":"/ˌkwɒlɪfɪˈkeɪʃən/","v":"bằng cấp","ex":"This job requires special qualifications.","exv":"Công việc này yêu cầu bằng cấp đặc biệt.","lv":"B1","topic":"Work & Jobs"},{"w":"salary","ph":"/ˈsæləri/","v":"mức lương","ex":"His salary increased this year.","exv":"Lương của anh ấy tăng năm nay.","lv":"B1","topic":"Work & Jobs"},{"w":"career","ph":"/kəˈrɪər/","v":"sự nghiệp","ex":"She is planning her career carefully.","exv":"Cô ấy đang lên kế hoạch sự nghiệp cẩn thận.","lv":"B1","topic":"Work & Jobs"},{"w":"employer","ph":"/ɪmˈplɔɪər/","v":"người sử dụng lao động","ex":"The employer offered training courses.","exv":"Người sử dụng lao động cung cấp khóa đào tạo.","lv":"B1","topic":"Work & Jobs"},{"w":"pollution","ph":"/pəˈluːʃən/","v":"ô nhiễm","ex":"Pollution affects air quality.","exv":"Ô nhiễm ảnh hưởng đến chất lượng không khí.","lv":"B1","topic":"Environment"},{"w":"recycle","ph":"/ˌriːˈsaɪkl/","v":"tái chế","ex":"We recycle plastic bottles.","exv":"Chúng tôi tái chế chai nhựa.","lv":"B1","topic":"Environment"},{"w":"renewable energy","ph":"/rɪˈnuːəbl ˈenədʒi/","v":"năng lượng tái tạo","ex":"Solar power is renewable energy.","exv":"Năng lượng mặt trời là năng lượng tái tạo.","lv":"B1","topic":"Environment"},{"w":"climate change","ph":"/ˈklaɪmət tʃeɪndʒ/","v":"biến đổi khí hậu","ex":"Climate change affects the planet.","exv":"Biến đổi khí hậu ảnh hưởng đến hành tinh.","lv":"B1","topic":"Environment"},{"w":"conservation","ph":"/ˌkɒnsəˈveɪʃən/","v":"bảo tồn","ex":"Wildlife conservation is essential.","exv":"Bảo tồn động vật hoang dã rất cần thiết.","lv":"B1","topic":"Environment"},{"w":"ecosystem","ph":"/ˈiːkəʊsɪstəm/","v":"hệ sinh thái","ex":"The ecosystem supports many species.","exv":"Hệ sinh thái hỗ trợ nhiều loài sinh vật.","lv":"B1","topic":"Environment"},{"w":"natural resource","ph":"/ˈnætʃrəl rɪˈsɔːs/","v":"tài nguyên thiên nhiên","ex":"Water is a valuable natural resource.","exv":"Nước là tài nguyên thiên nhiên quý giá.","lv":"B1","topic":"Environment"},{"w":"sustainability","ph":"/səˌsteɪnəˈbɪləti/","v":"tính bền vững","ex":"Sustainability is a global concern.","exv":"Tính bền vững là mối quan tâm toàn cầu.","lv":"B1","topic":"Environment"},{"w":"investment","ph":"/ɪnˈvestmənt/","v":"đầu tư","ex":"The company made a large investment.","exv":"Công ty đã thực hiện một khoản đầu tư lớn.","lv":"B2","topic":"Business & Finance"},{"w":"revenue","ph":"/ˈrevənjuː/","v":"doanh thu","ex":"Revenue increased by ten percent.","exv":"Doanh thu tăng mười phần trăm.","lv":"B2","topic":"Business & Finance"},{"w":"profit","ph":"/ˈprɒfɪt/","v":"lợi nhuận","ex":"The business generated a profit.","exv":"Doanh nghiệp tạo ra lợi nhuận.","lv":"B2","topic":"Business & Finance"},{"w":"budget","ph":"/ˈbʌdʒɪt/","v":"ngân sách","ex":"We need to stay within budget.","exv":"Chúng ta cần ở trong ngân sách.","lv":"B2","topic":"Business & Finance"},{"w":"financial risk","ph":"/faɪˈnænʃl rɪsk/","v":"rủi ro tài chính","ex":"Every investment involves financial risk.","exv":"Mọi khoản đầu tư đều có rủi ro tài chính.","lv":"B2","topic":"Business & Finance"},{"w":"shareholder","ph":"/ˈʃerˌhəʊldər/","v":"cổ đông","ex":"The shareholders approved the plan.","exv":"Các cổ đông đã phê duyệt kế hoạch.","lv":"B2","topic":"Business & Finance"},{"w":"asset","ph":"/ˈæset/","v":"tài sản","ex":"Property is a valuable asset.","exv":"Bất động sản là tài sản có giá trị.","lv":"B2","topic":"Business & Finance"},{"w":"cash flow","ph":"/kæʃ fləʊ/","v":"dòng tiền","ex":"Cash flow is important for business growth.","exv":"Dòng tiền quan trọng cho sự phát triển doanh nghiệp.","lv":"B2","topic":"Business & Finance"},{"w":"innovation","ph":"/ˌɪnəˈveɪʃən/","v":"đổi mới sáng tạo","ex":"Innovation drives economic growth.","exv":"Đổi mới thúc đẩy tăng trưởng kinh tế.","lv":"B2","topic":"Media & Technology"},{"w":"artificial intelligence","ph":"/ˌɑːrtɪfɪʃl ɪnˈtelɪdʒəns/","v":"trí tuệ nhân tạo","ex":"Artificial intelligence is changing industries.","exv":"Trí tuệ nhân tạo đang thay đổi các ngành công nghiệp.","lv":"B2","topic":"Media & Technology"},{"w":"algorithm","ph":"/ˈælɡərɪðəm/","v":"thuật toán","ex":"The algorithm processes data quickly.","exv":"Thuật toán xử lý dữ liệu nhanh chóng.","lv":"B2","topic":"Media & Technology"},{"w":"cybersecurity","ph":"/ˌsaɪbəsɪˈkjʊərəti/","v":"an ninh mạng","ex":"Cybersecurity protects sensitive information.","exv":"An ninh mạng bảo vệ thông tin nhạy cảm.","lv":"B2","topic":"Media & Technology"},{"w":"digital platform","ph":"/ˈdɪdʒɪtl ˈplætfɔːrm/","v":"nền tảng số","ex":"Many businesses use digital platforms.","exv":"Nhiều doanh nghiệp sử dụng nền tảng số.","lv":"B2","topic":"Media & Technology"},{"w":"automation","ph":"/ˌɔːtəˈmeɪʃən/","v":"tự động hóa","ex":"Automation increases efficiency.","exv":"Tự động hóa làm tăng hiệu quả.","lv":"B2","topic":"Media & Technology"},{"w":"data privacy","ph":"/ˈdeɪtə ˈprɪvəsi/","v":"quyền riêng tư dữ liệu","ex":"Data privacy is a major concern.","exv":"Quyền riêng tư dữ liệu là mối quan tâm lớn.","lv":"B2","topic":"Media & Technology"},{"w":"virtual reality","ph":"/ˈvɜːtʃuəl riˈæləti/","v":"thực tế ảo","ex":"Virtual reality creates immersive experiences.","exv":"Thực tế ảo tạo ra trải nghiệm sống động.","lv":"B2","topic":"Media & Technology"},{"w":"motivation","ph":"/ˌməʊtɪˈveɪʃən/","v":"động lực","ex":"Motivation helps people achieve goals.","exv":"Động lực giúp con người đạt mục tiêu.","lv":"B2","topic":"Psychology & Emotions"},{"w":"self-esteem","ph":"/ˌself ɪˈstiːm/","v":"lòng tự trọng","ex":"Healthy self-esteem improves confidence.","exv":"Lòng tự trọng lành mạnh giúp tăng tự tin.","lv":"B2","topic":"Psychology & Emotions"},{"w":"anxiety","ph":"/æŋˈzaɪəti/","v":"lo âu","ex":"Exams can cause anxiety.","exv":"Các kỳ thi có thể gây lo âu.","lv":"B2","topic":"Psychology & Emotions"},{"w":"empathy","ph":"/ˈempəθi/","v":"sự đồng cảm","ex":"Empathy improves relationships.","exv":"Sự đồng cảm cải thiện các mối quan hệ.","lv":"B2","topic":"Psychology & Emotions"},{"w":"perception","ph":"/pəˈsepʃən/","v":"nhận thức","ex":"Perception varies among individuals.","exv":"Nhận thức khác nhau giữa mỗi người.","lv":"B2","topic":"Psychology & Emotions"},{"w":"personality","ph":"/ˌpɜːsəˈnæləti/","v":"tính cách","ex":"Personality develops over time.","exv":"Tính cách phát triển theo thời gian.","lv":"B2","topic":"Psychology & Emotions"},{"w":"stress management","ph":"/stres ˈmænɪdʒmənt/","v":"quản lý căng thẳng","ex":"Stress management is an important skill.","exv":"Quản lý căng thẳng là kỹ năng quan trọng.","lv":"B2","topic":"Psychology & Emotions"},{"w":"emotional intelligence","ph":"/ɪˈməʊʃənl ɪnˈtelɪdʒəns/","v":"trí tuệ cảm xúc","ex":"Emotional intelligence helps leaders succeed.","exv":"Trí tuệ cảm xúc giúp nhà lãnh đạo thành công.","lv":"B2","topic":"Psychology & Emotions"},{"w":"thesis statement","ph":"/ˈθiːsɪs ˈsteɪtmənt/","v":"luận đề","ex":"A thesis statement guides the essay.","exv":"Luận đề định hướng bài luận.","lv":"C1","topic":"Academic Writing"},{"w":"citation","ph":"/saɪˈteɪʃən/","v":"trích dẫn","ex":"Every source requires proper citation.","exv":"Mọi nguồn đều cần được trích dẫn đúng cách.","lv":"C1","topic":"Academic Writing"},{"w":"coherence","ph":"/kəʊˈhɪərəns/","v":"tính mạch lạc","ex":"Coherence improves readability.","exv":"Tính mạch lạc giúp bài viết dễ đọc hơn.","lv":"C1","topic":"Academic Writing"},{"w":"argumentation","ph":"/ˌɑːɡjumənˈteɪʃən/","v":"lập luận","ex":"Strong argumentation supports the conclusion.","exv":"Lập luận chặt chẽ hỗ trợ kết luận.","lv":"C1","topic":"Academic Writing"},{"w":"methodology","ph":"/ˌmeθəˈdɒlədʒi/","v":"phương pháp nghiên cứu","ex":"The methodology is clearly explained.","exv":"Phương pháp nghiên cứu được giải thích rõ ràng.","lv":"C1","topic":"Academic Writing"},{"w":"paraphrase","ph":"/ˈpærəfreɪz/","v":"diễn đạt lại","ex":"Paraphrase the source in your own words.","exv":"Hãy diễn đạt lại nguồn bằng lời của bạn.","lv":"C1","topic":"Academic Writing"},{"w":"academic journal","ph":"/ˌækəˈdemɪk ˈdʒɜːrnl/","v":"tạp chí học thuật","ex":"The article was published in an academic journal.","exv":"Bài báo được xuất bản trên tạp chí học thuật.","lv":"C1","topic":"Academic Writing"},{"w":"literature review","ph":"/ˈlɪtrətʃər rɪˈvjuː/","v":"tổng quan tài liệu","ex":"The literature review summarizes previous studies.","exv":"Tổng quan tài liệu tóm tắt các nghiên cứu trước đó.","lv":"C1","topic":"Academic Writing"},{"w":"legislation","ph":"/ˌledʒɪsˈleɪʃən/","v":"luật pháp","ex":"New legislation was introduced recently.","exv":"Luật mới được ban hành gần đây.","lv":"C1","topic":"Law & Society"},{"w":"justice","ph":"/ˈdʒʌstɪs/","v":"công lý","ex":"Everyone deserves justice.","exv":"Mọi người đều xứng đáng có công lý.","lv":"C1","topic":"Law & Society"},{"w":"constitutional rights","ph":"/ˌkɒnstɪˈtjuːʃənl raɪts/","v":"quyền hiến định","ex":"Citizens have constitutional rights.","exv":"Công dân có các quyền hiến định.","lv":"C1","topic":"Law & Society"},{"w":"discrimination","ph":"/dɪˌskrɪmɪˈneɪʃən/","v":"sự phân biệt đối xử","ex":"Laws prohibit discrimination.","exv":"Luật pháp cấm phân biệt đối xử.","lv":"C1","topic":"Law & Society"},{"w":"public policy","ph":"/ˈpʌblɪk ˈpɒləsi/","v":"chính sách công","ex":"Public policy affects daily life.","exv":"Chính sách công ảnh hưởng đến cuộc sống hằng ngày.","lv":"C1","topic":"Law & Society"},{"w":"civil liberty","ph":"/ˈsɪvl ˈlɪbəti/","v":"quyền tự do dân sự","ex":"Civil liberties must be protected.","exv":"Các quyền tự do dân sự phải được bảo vệ.","lv":"C1","topic":"Law & Society"},{"w":"legal system","ph":"/ˈliːɡl ˈsɪstəm/","v":"hệ thống pháp luật","ex":"Every country has a legal system.","exv":"Mỗi quốc gia có một hệ thống pháp luật.","lv":"C1","topic":"Law & Society"},{"w":"social justice","ph":"/ˈsəʊʃl ˈdʒʌstɪs/","v":"công bằng xã hội","ex":"Social justice promotes equality.","exv":"Công bằng xã hội thúc đẩy bình đẳng.","lv":"C1","topic":"Law & Society"},{"w":"morality","ph":"/məˈræləti/","v":"đạo đức","ex":"Morality influences human behavior.","exv":"Đạo đức ảnh hưởng đến hành vi con người.","lv":"C1","topic":"Philosophy & Ethics"},{"w":"ethical dilemma","ph":"/ˈeθɪkl dɪˈlemə/","v":"tình huống tiến thoái lưỡng nan về đạo đức","ex":"The case presents an ethical dilemma.","exv":"Tình huống này đặt ra vấn đề đạo đức khó xử.","lv":"C1","topic":"Philosophy & Ethics"},{"w":"virtue","ph":"/ˈvɜːrtʃuː/","v":"đức hạnh","ex":"Honesty is considered a virtue.","exv":"Trung thực được xem là một đức hạnh.","lv":"C1","topic":"Philosophy & Ethics"},{"w":"free will","ph":"/ˌfriː ˈwɪl/","v":"ý chí tự do","ex":"Philosophers debate free will.","exv":"Các triết gia tranh luận về ý chí tự do.","lv":"C1","topic":"Philosophy & Ethics"},{"w":"consciousness","ph":"/ˈkɒnʃəsnəs/","v":"ý thức","ex":"The nature of consciousness remains mysterious.","exv":"Bản chất của ý thức vẫn còn bí ẩn.","lv":"C1","topic":"Philosophy & Ethics"},{"w":"justice theory","ph":"/ˈdʒʌstɪs ˈθɪəri/","v":"học thuyết công lý","ex":"Students studied justice theory.","exv":"Sinh viên nghiên cứu học thuyết công lý.","lv":"C1","topic":"Philosophy & Ethics"},{"w":"moral responsibility","ph":"/ˈmɒrəl rɪˌspɒnsəˈbɪləti/","v":"trách nhiệm đạo đức","ex":"People have moral responsibility for their actions.","exv":"Con người có trách nhiệm đạo đức với hành động của mình.","lv":"C1","topic":"Philosophy & Ethics"},{"w":"ethical principle","ph":"/ˈeθɪkl ˈprɪnsəpl/","v":"nguyên tắc đạo đức","ex":"The decision follows ethical principles.","exv":"Quyết định tuân theo các nguyên tắc đạo đức.","lv":"C1","topic":"Philosophy & Ethics"}]; // baked-in export
+let customVocab     = [];
 let currentScene    = 'cafe';
 let balloonInterval = null; let balloonWords = []; let balloonCurrent = null; let balloonScore = 0; let balloonHearts = 3;
 let matchPairs      = []; let matchSelected = null; let matchCount = 0;
@@ -6847,5 +5950,5 @@ friend,/frend/,Bạn bè 👫,She is my best friend.,Cô ấy là bạn thân c�
 }
 
 </script>
-
-</body></html>
+</body>
+</html>
